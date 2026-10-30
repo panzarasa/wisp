@@ -1,0 +1,6 @@
+.git
+bench/results
+bench/report.pdf
+autobahn/bin
+autobahn/reports
+bench/results-ws

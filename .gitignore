@@ -1,0 +1,11 @@
+# Benchmark and conformance output: the numbers worth keeping are in README.md.
+bench/results/
+bench/results-*/
+bench/report.pdf
+autobahn/bin/
+autobahn/reports/
+
+# Working notes, kept out of the repository.
+todo.txt
+
+.DS_Store
