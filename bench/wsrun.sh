@@ -2,7 +2,7 @@
 # WebSocket benchmarks: runs inside the benchmark image (see Dockerfile), like
 # run.sh does for HTTP; wsbench.sh is the host side.
 #
-# Two servers with the same endpoints: "wisp" is cmd/server (httpd on gnet,
+# Two servers with the same endpoints: "wisp" is cmd/server (wisp on gnet,
 # one event loop), "gorilla" is bench/rivals/gorilla (gorilla/websocket on
 # net/http). Each run starts a fresh server pinned to SERVER_CPUS, loads it
 # with wsload pinned to CLIENT_CPUS over the loopback interface, and stops it.

@@ -25,30 +25,30 @@ import (
 
 	"github.com/panjf2000/gnet/v2"
 
-	"github.com/panzarasa/wisp/httpd"
+	"github.com/panzarasa/wisp"
 )
 
 func main() {
-	r := httpd.NewRouter()
+	r := wisp.NewRouter()
 
-	r.GET("/", func(c *httpd.Ctx) {
+	r.GET("/", func(c *wisp.Ctx) {
 		c.Text(200, "Hello, World!")
 	})
 
-	r.GET("/users/:id", func(c *httpd.Ctx) {
-		c.Bytes(200, "text/plain; charset=utf-8", append([]byte("user "), c.Param("id")...))
+	r.GET("/users/:id", func(c *wisp.Ctx) {
+		c.Bytes(200, wisp.MIMETextPlain, append([]byte("user "), c.Param("id")...))
 	})
 
-	echo := &httpd.WSHandler{
-		OnMessage: func(ws *httpd.WSConn, typ httpd.WSMessageType, data []byte) {
+	echo := &wisp.WSHandler{
+		OnMessage: func(ws *wisp.WSConn, typ wisp.WSMessageType, data []byte) {
 			ws.Send(typ, data)
 		},
 	}
-	r.GET("/ws/echo", func(c *httpd.Ctx) {
+	r.GET("/ws/echo", func(c *wisp.Ctx) {
 		c.Upgrade(echo)
 	})
 
-	srv := &httpd.Server{Handler: r.Serve}
+	srv := &wisp.Server{Handler: r.Serve}
 	log.Fatal(srv.ListenAndServe(":8080", gnet.WithMulticore(true), gnet.WithReuseAddr(true)))
 }
 ```
@@ -181,7 +181,7 @@ parameters.
 ## Layout
 
 ```
-httpd/           server, router, WebSocket
+*.go             package wisp: server, router, WebSocket, MIME constants (mime.go)
 wildcat/         embedded HTTP request parser (BSD 2-Clause, see wildcat/LICENSE)
 cmd/server       example server, also the benchmark target
 cmd/baseline     gnet alone, as a reference for the HTTP layer's cost

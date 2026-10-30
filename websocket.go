@@ -1,4 +1,4 @@
-package httpd
+package wisp
 
 // WebSocket (RFC 6455) on the same gnet connection as HTTP: a handler calls
 // Ctx.Upgrade, the 101 response goes out, and from then on the connection's
@@ -40,23 +40,23 @@ const (
 
 var (
 	// Upgrade errors: the response (400, 403, 426 or 503) is already written.
-	ErrWSHandshake   = errors.New("httpd: invalid WebSocket handshake")
-	ErrWSOrigin      = errors.New("httpd: WebSocket origin not allowed")
-	ErrWSUnavailable = errors.New("httpd: server shutting down")
+	ErrWSHandshake   = errors.New("wisp: invalid WebSocket handshake")
+	ErrWSOrigin      = errors.New("wisp: WebSocket origin not allowed")
+	ErrWSUnavailable = errors.New("wisp: server shutting down")
 
 	// ErrWSClosed is returned by Send and Close once the closing handshake
 	// has started or the connection is gone.
-	ErrWSClosed = errors.New("httpd: WebSocket connection closed")
+	ErrWSClosed = errors.New("wisp: WebSocket connection closed")
 	// ErrWSOutboundFull is returned by Send when the peer does not read
 	// fast enough: MaxOutboundBytes are already waiting. The connection is
 	// dropped.
-	ErrWSOutboundFull = errors.New("httpd: WebSocket outbound limit reached")
+	ErrWSOutboundFull = errors.New("wisp: WebSocket outbound limit reached")
 	// ErrWSInvalidMessage is returned by Send for a type other than WSText
 	// or WSBinary, or for text that is not valid UTF-8.
-	ErrWSInvalidMessage = errors.New("httpd: invalid WebSocket message")
+	ErrWSInvalidMessage = errors.New("wisp: invalid WebSocket message")
 	// ErrWSInvalidClose is returned by Close for a code that cannot be sent
 	// or a reason longer than 123 bytes or not valid UTF-8.
-	ErrWSInvalidClose = errors.New("httpd: invalid WebSocket close code or reason")
+	ErrWSInvalidClose = errors.New("wisp: invalid WebSocket close code or reason")
 )
 
 // WSHandler is what a WebSocket endpoint does; one value usually serves
@@ -499,7 +499,7 @@ func (ws *WSConn) fail(code int, reason string) bool {
 func (ws *WSConn) serve(buf []byte) (consumed int, closeConn bool) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("httpd: panic in WebSocket handler for %s: %v\n%s", ws.remoteAddr, r, debug.Stack())
+			log.Printf("wisp: panic in WebSocket handler for %s: %v\n%s", ws.remoteAddr, r, debug.Stack())
 			closeConn = ws.fail(CloseInternalError, "")
 		}
 	}()
@@ -745,7 +745,7 @@ func (s *Server) wsDetach(ws *WSConn) {
 	}
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("httpd: panic in WebSocket OnClose for %s: %v\n%s", ws.remoteAddr, r, debug.Stack())
+			log.Printf("wisp: panic in WebSocket OnClose for %s: %v\n%s", ws.remoteAddr, r, debug.Stack())
 		}
 	}()
 	ws.h.OnClose(ws, code, reason)

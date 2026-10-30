@@ -1,5 +1,5 @@
 // Command server is gnet with our HTTP layer on top: the embedded wildcat
-// parser plus the httpd router. /ws/echo and /ws/chat upgrade their
+// parser plus the wisp router. /ws/echo and /ws/chat upgrade their
 // connection to WebSocket, on the same port.
 package main
 
@@ -16,37 +16,37 @@ import (
 
 	"github.com/panjf2000/gnet/v2"
 
-	"github.com/panzarasa/wisp/httpd"
+	"github.com/panzarasa/wisp"
 )
 
 func main() {
 	addr := flag.String("addr", ":8080", "listen address")
 	loops := flag.Int("loops", 0, "number of event loops (0 = one per CPU)")
 	wsOrigins := flag.String("ws-origins", "", `comma-separated origins allowed to open a WebSocket, such as "http://localhost:8080" ("*" = any; empty = same origin only)`)
-	wsMaxMessage := flag.Int("ws-max-message", httpd.DefaultWSMaxMessageBytes, "largest WebSocket message accepted, in bytes")
+	wsMaxMessage := flag.Int("ws-max-message", wisp.DefaultWSMaxMessageBytes, "largest WebSocket message accepted, in bytes")
 	flag.Parse()
 
-	r := httpd.NewRouter()
+	r := wisp.NewRouter()
 
-	r.GET("/", func(c *httpd.Ctx) {
+	r.GET("/", func(c *wisp.Ctx) {
 		c.Text(200, "Hello, World!")
 	})
 
-	r.GET("/users/:id", func(c *httpd.Ctx) {
+	r.GET("/users/:id", func(c *wisp.Ctx) {
 		body := append(make([]byte, 0, 64), "user "...)
 		body = append(body, c.Param("id")...)
-		c.Bytes(200, "text/plain; charset=utf-8", body)
+		c.Bytes(200, wisp.MIMETextPlain, body)
 	})
 
-	r.POST("/echo", func(c *httpd.Ctx) {
-		contentType := "application/octet-stream"
+	r.POST("/echo", func(c *wisp.Ctx) {
+		contentType := wisp.MIMEOctetStream
 		if v := c.Header("Content-Type"); len(v) > 0 {
 			contentType = string(v)
 		}
 		c.Bytes(200, contentType, c.Body)
 	})
 
-	r.GET("/static/*file", func(c *httpd.Ctx) {
+	r.GET("/static/*file", func(c *wisp.Ctx) {
 		c.Text(200, "file "+string(c.Param("file")))
 	})
 
@@ -55,16 +55,16 @@ func main() {
 		origins = strings.Split(*wsOrigins, ",")
 	}
 
-	echo := &httpd.WSHandler{
+	echo := &wisp.WSHandler{
 		AllowedOrigins:  origins,
 		MaxMessageBytes: *wsMaxMessage,
 		// Room for a few echoed messages to a client that reads slowly.
-		MaxOutboundBytes: max(httpd.DefaultWSMaxOutboundBytes, 4**wsMaxMessage),
-		OnMessage: func(ws *httpd.WSConn, typ httpd.WSMessageType, data []byte) {
+		MaxOutboundBytes: max(wisp.DefaultWSMaxOutboundBytes, 4**wsMaxMessage),
+		OnMessage: func(ws *wisp.WSConn, typ wisp.WSMessageType, data []byte) {
 			ws.Send(typ, data)
 		},
 	}
-	r.GET("/ws/echo", func(c *httpd.Ctx) {
+	r.GET("/ws/echo", func(c *wisp.Ctx) {
 		c.Upgrade(echo)
 	})
 
@@ -72,28 +72,28 @@ func main() {
 	// from any event loop, so members on other loops are reached too.
 	var (
 		mu      sync.Mutex
-		members = map[*httpd.WSConn]struct{}{}
+		members = map[*wisp.WSConn]struct{}{}
 	)
-	chat := &httpd.WSHandler{
+	chat := &wisp.WSHandler{
 		AllowedOrigins:  origins,
 		MaxMessageBytes: *wsMaxMessage,
-		OnMessage: func(_ *httpd.WSConn, typ httpd.WSMessageType, data []byte) {
-			if typ != httpd.WSText {
+		OnMessage: func(_ *wisp.WSConn, typ wisp.WSMessageType, data []byte) {
+			if typ != wisp.WSText {
 				return
 			}
 			mu.Lock()
 			defer mu.Unlock()
 			for m := range members {
-				m.Send(httpd.WSText, data)
+				m.Send(wisp.WSText, data)
 			}
 		},
-		OnClose: func(ws *httpd.WSConn, _ int, _ string) {
+		OnClose: func(ws *wisp.WSConn, _ int, _ string) {
 			mu.Lock()
 			delete(members, ws)
 			mu.Unlock()
 		},
 	}
-	r.GET("/ws/chat", func(c *httpd.Ctx) {
+	r.GET("/ws/chat", func(c *wisp.Ctx) {
 		ws, err := c.Upgrade(chat)
 		if err != nil {
 			return
@@ -103,7 +103,7 @@ func main() {
 		mu.Unlock()
 	})
 
-	srv := &httpd.Server{Handler: r.Serve}
+	srv := &wisp.Server{Handler: r.Serve}
 
 	go func() {
 		sig := make(chan os.Signal, 1)

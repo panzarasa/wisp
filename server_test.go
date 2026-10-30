@@ -1,4 +1,4 @@
-package httpd
+package wisp
 
 import (
 	"bufio"
@@ -35,10 +35,10 @@ func splitResponse(t *testing.T, raw []byte) (int, string) {
 func testHandler() Handler {
 	r := NewRouter()
 	r.GET("/", func(c *Ctx) { c.Text(200, "Hello, World!") })
-	r.GET("/users/:id", func(c *Ctx) { c.Bytes(200, "text/plain; charset=utf-8", c.Param("id")) })
-	r.GET("/query", func(c *Ctx) { c.Bytes(200, "text/plain", c.Query) })
-	r.GET("/agent", func(c *Ctx) { c.Bytes(200, "text/plain", c.Header("user-agent")) })
-	r.POST("/echo", func(c *Ctx) { c.Bytes(200, "application/octet-stream", c.Body) })
+	r.GET("/users/:id", func(c *Ctx) { c.Bytes(200, MIMETextPlain, c.Param("id")) })
+	r.GET("/query", func(c *Ctx) { c.Bytes(200, MIMETextPlain, c.Query) })
+	r.GET("/agent", func(c *Ctx) { c.Bytes(200, MIMETextPlain, c.Header("user-agent")) })
+	r.POST("/echo", func(c *Ctx) { c.Bytes(200, MIMEOctetStream, c.Body) })
 	r.GET("/silent", func(c *Ctx) {})
 	r.GET("/twice", func(c *Ctx) { c.Text(500, "first"); c.Text(200, "second") })
 	r.GET("/header", func(c *Ctx) { c.SetHeader("X-Test", "yes"); c.Status(204) })
@@ -435,7 +435,7 @@ func TestServerWithHTTPClient(t *testing.T) {
 	// A body much larger than gnet's 64 KiB read buffer arrives over many
 	// events and has to come back intact.
 	payload := bytes.Repeat([]byte("0123456789abcdef"), 1<<16) // 1 MiB
-	resp, err := client.Post("http://"+addr+"/echo", "application/octet-stream", bytes.NewReader(payload))
+	resp, err := client.Post("http://"+addr+"/echo", MIMEOctetStream, bytes.NewReader(payload))
 	if err != nil {
 		t.Fatal(err)
 	}

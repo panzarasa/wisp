@@ -1,6 +1,6 @@
 #!/bin/sh
 # Builds the benchmark image and runs the WebSocket benchmarks (wsrun.sh)
-# in it: gnet + httpd against gorilla/websocket on net/http.
+# in it: wisp against gorilla/websocket on net/http.
 #
 #   bench/wsbench.sh                        full run (about 20 minutes)
 #   REPS=1 DURATION=3s bench/wsbench.sh     quick look

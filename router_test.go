@@ -1,4 +1,4 @@
-package httpd
+package wisp
 
 import (
 	"strings"

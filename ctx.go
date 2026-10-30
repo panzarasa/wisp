@@ -1,4 +1,4 @@
-package httpd
+package wisp
 
 import (
 	"strconv"
@@ -108,12 +108,12 @@ func (c *Ctx) String(status int, contentType string, body string) {
 
 // Text writes a text/plain response.
 func (c *Ctx) Text(status int, body string) {
-	c.String(status, "text/plain; charset=utf-8", body)
+	c.String(status, MIMETextPlain, body)
 }
 
 // JSON writes an already encoded JSON document.
 func (c *Ctx) JSON(status int, body []byte) {
-	c.Bytes(status, "application/json", body)
+	c.Bytes(status, MIMEApplicationJSON, body)
 }
 
 // Status writes a response without a body.

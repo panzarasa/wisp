@@ -1,4 +1,4 @@
-package httpd
+package wisp
 
 // The WebSocket wire format (RFC 6455, section 5) and the pieces of the
 // protocol that do not depend on a connection: frame encoding, masking,

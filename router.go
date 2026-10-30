@@ -1,4 +1,4 @@
-package httpd
+package wisp
 
 import (
 	"bytes"
@@ -60,10 +60,10 @@ func (r *Router) DELETE(pattern string, h Handler) { r.Handle("DELETE", pattern,
 // conflicting pattern, like http.ServeMux.
 func (r *Router) Handle(method, pattern string, h Handler) {
 	if method == "" || h == nil {
-		panic("httpd: empty method or nil handler for " + pattern)
+		panic("wisp: empty method or nil handler for " + pattern)
 	}
 	if !strings.HasPrefix(pattern, "/") {
-		panic(fmt.Sprintf("httpd: pattern %q must begin with '/'", pattern))
+		panic(fmt.Sprintf("wisp: pattern %q must begin with '/'", pattern))
 	}
 
 	mr := r.methods[method]
@@ -82,13 +82,13 @@ func (r *Router) Handle(method, pattern string, h Handler) {
 		case strings.HasPrefix(seg, "*"):
 			key := seg[1:]
 			if key == "" || !last {
-				panic(fmt.Sprintf("httpd: %q: a '*name' segment must be named and be the last one", pattern))
+				panic(fmt.Sprintf("wisp: %q: a '*name' segment must be named and be the last one", pattern))
 			}
 			if n.catchAll != nil {
-				panic(fmt.Sprintf("httpd: %s %q conflicts with an existing route", method, pattern))
+				panic(fmt.Sprintf("wisp: %s %q conflicts with an existing route", method, pattern))
 			}
 			if nparams++; nparams > MaxParams {
-				panic(fmt.Sprintf("httpd: %q has more than %d parameters", pattern, MaxParams))
+				panic(fmt.Sprintf("wisp: %q has more than %d parameters", pattern, MaxParams))
 			}
 			n.catchAll, n.catchKey = h, key
 			return
@@ -96,15 +96,15 @@ func (r *Router) Handle(method, pattern string, h Handler) {
 		case strings.HasPrefix(seg, ":"):
 			key := seg[1:]
 			if key == "" {
-				panic(fmt.Sprintf("httpd: %q: a ':name' segment must be named", pattern))
+				panic(fmt.Sprintf("wisp: %q: a ':name' segment must be named", pattern))
 			}
 			if n.param == nil {
 				n.param, n.paramKey = &node{}, key
 			} else if n.paramKey != key {
-				panic(fmt.Sprintf("httpd: %q names a parameter :%s where an existing route names it :%s", pattern, key, n.paramKey))
+				panic(fmt.Sprintf("wisp: %q names a parameter :%s where an existing route names it :%s", pattern, key, n.paramKey))
 			}
 			if nparams++; nparams > MaxParams {
-				panic(fmt.Sprintf("httpd: %q has more than %d parameters", pattern, MaxParams))
+				panic(fmt.Sprintf("wisp: %q has more than %d parameters", pattern, MaxParams))
 			}
 			n = n.param
 
@@ -122,7 +122,7 @@ func (r *Router) Handle(method, pattern string, h Handler) {
 	}
 
 	if n.handler != nil {
-		panic(fmt.Sprintf("httpd: %s %q conflicts with an existing route", method, pattern))
+		panic(fmt.Sprintf("wisp: %s %q conflicts with an existing route", method, pattern))
 	}
 	n.handler = h
 	if nparams == 0 {

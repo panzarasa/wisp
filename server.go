@@ -1,4 +1,4 @@
-// Package httpd is a small HTTP/1.1 server on top of gnet: requests are parsed
+// Package wisp is a small HTTP/1.1 server on top of gnet: requests are parsed
 // in place with the embedded wildcat parser and dispatched by a Router.
 // A handler can switch its connection to WebSocket (RFC 6455) with
 // Ctx.Upgrade: the same gnet connection then carries frames (websocket.go).
@@ -12,7 +12,7 @@
 // and a bound on the responses queued for a client that pipelines without
 // reading. WebSocket connections have their own timeouts and limits, but no
 // extensions (permessage-deflate).
-package httpd
+package wisp
 
 import (
 	"bytes"
@@ -78,7 +78,7 @@ type connState struct {
 // "tcp://127.0.0.1:8080") until Shutdown is called or gnet fails.
 func (s *Server) ListenAndServe(addr string, opts ...gnet.Option) error {
 	if s.Handler == nil {
-		return errors.New("httpd: Server.Handler is nil")
+		return errors.New("wisp: Server.Handler is nil")
 	}
 	if !strings.Contains(addr, "://") {
 		addr = "tcp://" + addr
@@ -94,7 +94,7 @@ func (s *Server) ListenAndServe(addr string, opts ...gnet.Option) error {
 func (s *Server) Shutdown(ctx context.Context) error {
 	eng := s.engine.Load()
 	if eng == nil {
-		return errors.New("httpd: server is not running")
+		return errors.New("wisp: server is not running")
 	}
 	s.wsShutdownAll(ctx)
 	// Stop stops the engine even when ctx has already expired.
@@ -220,7 +220,7 @@ func (h *eventHandler) OnTraffic(c gnet.Conn) gnet.Action {
 func (s *Server) serve(st *connState, buf []byte) (consumed int, closeConn bool) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("httpd: panic serving %s %s: %v\n%s", st.ctx.Method, st.ctx.Path, r, debug.Stack())
+			log.Printf("wisp: panic serving %s %s: %v\n%s", st.ctx.Method, st.ctx.Path, r, debug.Stack())
 			st.ctx.fail(500)
 			closeConn = true
 		}

@@ -28,7 +28,7 @@ func main() {
 	})
 
 	app.Post("/echo", func(c fiber.Ctx) error {
-		contentType := "application/octet-stream"
+		contentType := fiber.MIMEOctetStream
 		if v := c.Get(fiber.HeaderContentType); v != "" {
 			contentType = v
 		}
