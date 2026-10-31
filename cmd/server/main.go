@@ -1,10 +1,12 @@
 // Command server is gnet with our HTTP layer on top: the embedded wildcat
 // parser plus the wisp router. /ws/echo and /ws/chat upgrade their
-// connection to WebSocket, on the same port.
+// connection to WebSocket, on the same port; /chat is a page that talks to
+// /ws/chat. With -tls-addr, -cert and -key it serves HTTPS too.
 package main
 
 import (
 	"context"
+	_ "embed"
 	"flag"
 	"log"
 	"os"
@@ -24,6 +26,10 @@ func main() {
 	loops := flag.Int("loops", 0, "number of event loops (0 = one per CPU)")
 	wsOrigins := flag.String("ws-origins", "", `comma-separated origins allowed to open a WebSocket, such as "http://localhost:8080" ("*" = any; empty = same origin only)`)
 	wsMaxMessage := flag.Int("ws-max-message", wisp.DefaultWSMaxMessageBytes, "largest WebSocket message accepted, in bytes")
+	wsCompress := flag.Bool("ws-compress", true, "offer permessage-deflate to WebSocket clients")
+	tlsAddr := flag.String("tls-addr", "", `HTTPS listen address, such as ":8443" (needs -cert and -key)`)
+	certFile := flag.String("cert", "", "TLS certificate, PEM")
+	keyFile := flag.String("key", "", "TLS private key, PEM")
 	flag.Parse()
 
 	r := wisp.NewRouter()
@@ -50,12 +56,21 @@ func main() {
 		c.Text(200, "file "+string(c.Param("file")))
 	})
 
+	r.GET("/chat", func(c *wisp.Ctx) {
+		c.String(200, wisp.MIMETextHTML, chatPage)
+	})
+
 	var origins []string
 	if *wsOrigins != "" {
 		origins = strings.Split(*wsOrigins, ",")
 	}
+	var compression *wisp.WSCompression
+	if *wsCompress {
+		compression = &wisp.WSCompression{}
+	}
 
 	echo := &wisp.WSHandler{
+		Compression:     compression,
 		AllowedOrigins:  origins,
 		MaxMessageBytes: *wsMaxMessage,
 		// Room for a few echoed messages to a client that reads slowly.
@@ -75,6 +90,7 @@ func main() {
 		members = map[*wisp.WSConn]struct{}{}
 	)
 	chat := &wisp.WSHandler{
+		Compression:     compression,
 		AllowedOrigins:  origins,
 		MaxMessageBytes: *wsMaxMessage,
 		OnMessage: func(_ *wisp.WSConn, typ wisp.WSMessageType, data []byte) {
@@ -124,8 +140,23 @@ func main() {
 		opts = []gnet.Option{gnet.WithReuseAddr(true), gnet.WithNumEventLoop(*loops)}
 	}
 
+	if *tlsAddr != "" {
+		if *certFile == "" || *keyFile == "" {
+			log.Fatal("-tls-addr needs -cert and -key")
+		}
+		go func() {
+			log.Printf("wisp listening on %s (TLS)", *tlsAddr)
+			if err := srv.ListenAndServeTLS(*tlsAddr, *certFile, *keyFile); err != nil {
+				log.Fatal(err)
+			}
+		}()
+	}
+
 	log.Printf("wisp listening on %s", *addr)
 	if err := srv.ListenAndServe(*addr, opts...); err != nil {
 		log.Fatal(err)
 	}
 }
+
+//go:embed chat.html
+var chatPage string

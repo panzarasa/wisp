@@ -14,11 +14,11 @@
 //     Host/Content-Length of the previous request visible;
 //   - Headers holds exactly the headers of the last request (len == count)
 //     instead of a fixed-size slice plus TotalHeaders;
-//   - a folded line before the first header returned a panic (index -1), it
-//     is now ErrBadProto;
-//   - a header line without ':' or with whitespace before ':' is ErrBadProto,
-//     as is a line break inside the method or the path. Upstream swallowed the
-//     following lines into the name;
+//   - the request line and the headers are validated (see Parse): upstream
+//     accepted control bytes, any version string, tabs as separators, header
+//     lines without ':' (swallowing the following lines into the name) and
+//     folded lines, which it joined with an allocation and which panicked
+//     before the first header. All of these are ErrBadProto now;
 //   - empty header values ("X-Foo:\r\n") parse as empty instead of "\r" or the
 //     next line, and trailing whitespace is trimmed from values;
 //   - ContentLength only accepts plain decimal digits.
@@ -96,200 +96,166 @@ var (
 	ErrUnsupported = errors.New("unsupported http feature")
 )
 
-const (
-	eNextHeader int = iota
-	eNextHeaderN
-	eHeader
-	eHeaderValueSpace
-	eHeaderValue
-	eHeaderValueN
-	eMLHeaderStart
-	eMLHeaderValue
-)
+// tchar marks the bytes allowed in a token (RFC 9110, section 5.6.2): methods
+// and header names.
+var tchar = func() (t [256]bool) {
+	for c := '0'; c <= '9'; c++ {
+		t[c] = true
+	}
+	for c := 'a'; c <= 'z'; c++ {
+		t[c], t[c-'a'+'A'] = true, true
+	}
+	for _, c := range "!#$%&'*+-.^_`|~" {
+		t[c] = true
+	}
+	return t
+}()
+
+// fieldByte marks the bytes allowed in a header value (RFC 9110, section
+// 5.5): visible ASCII, space, tab and obs-text. Control bytes are not.
+var fieldByte = func() (t [256]bool) {
+	for c := 0x20; c < 0x100; c++ {
+		t[c] = c != 0x7F
+	}
+	t['\t'] = true
+	return t
+}()
 
 // Parse the buffer as an HTTP Request. The buffer must contain the entire
 // request or Parse will return ErrMissingData for the caller to get more
 // data. (this thusly favors getting a completed request in a single Read()
 // call).
 //
+// The request line and the headers are validated (RFC 9112): the method is a
+// token followed by one space; the request target has no control bytes and
+// is followed by one space; the version is "HTTP/" DIGIT "." DIGIT; header
+// names are tokens directly followed by ':'; header values have no control
+// bytes but tab; lines end with CRLF, or a bare LF. Anything else, including
+// obsolete line folding, is ErrBadProto. Every strict prefix of a valid
+// request is ErrMissingData.
+//
 // Returns the number of bytes used by the header (thus where the body begins).
 func (hp *HTTPParser) Parse(input []byte) (int, error) {
+	hp.Method, hp.Path, hp.Version = nil, nil, nil
 	hp.Headers = hp.Headers[:0]
 	hp.host, hp.hostRead = nil, false
 	hp.contentLength, hp.contentLengthRead = -1, false
 
-	var headers int
-	var path int
-	var ok bool
-
 	total := len(input)
+	i := 0
 
-method:
-	for i := 0; i < total; i++ {
-		switch input[i] {
-		case ' ', '\t':
-			hp.Method = input[0:i]
-			ok = true
-			path = i + 1
-			break method
-		case '\r', '\n':
+	// method SP
+	for i < total && tchar[input[i]] {
+		i++
+	}
+	if i == total {
+		return 0, ErrMissingData
+	}
+	if i == 0 || input[i] != ' ' {
+		return 0, ErrBadProto
+	}
+	hp.Method = input[:i]
+	i++
+
+	// request-target SP
+	start := i
+	for i < total && input[i] > ' ' && input[i] != 0x7F {
+		i++
+	}
+	if i == total {
+		return 0, ErrMissingData
+	}
+	if i == start || input[i] != ' ' {
+		return 0, ErrBadProto
+	}
+	hp.Path = input[start:i]
+	i++
+
+	// HTTP-version = "HTTP/" DIGIT "." DIGIT
+	start = i
+	for k := 0; k < len("HTTP/1.1"); k++ {
+		if i == total {
+			return 0, ErrMissingData
+		}
+		c := input[i]
+		var ok bool
+		switch k {
+		case 5, 7:
+			ok = c >= '0' && c <= '9'
+		case 6:
+			ok = c == '.'
+		default:
+			ok = c == "HTTP/"[k]
+		}
+		if !ok {
 			return 0, ErrBadProto
 		}
+		i++
+	}
+	hp.Version = input[start:i]
+
+	i, err := lineEnd(input, i)
+	if err != nil {
+		return 0, err
 	}
 
-	if !ok {
-		return 0, ErrMissingData
-	}
+	for {
+		if i == total {
+			return 0, ErrMissingData
+		}
+		if c := input[i]; c == '\r' || c == '\n' {
+			// The empty line that ends the header.
+			return lineEnd(input, i)
+		}
 
-	var version int
-
-	ok = false
-
-path:
-	for i := path; i < total; i++ {
-		switch input[i] {
-		case ' ', '\t':
-			ok = true
-			hp.Path = input[path:i]
-			version = i + 1
-			break path
-		case '\r', '\n':
+		// field-name ":" OWS field-value OWS
+		start := i
+		for i < total && tchar[input[i]] {
+			i++
+		}
+		if i == total {
+			return 0, ErrMissingData
+		}
+		// A line that starts with whitespace is an obsolete folded
+		// continuation of the previous one: rejected (RFC 9112, section 5.2).
+		if i == start || input[i] != ':' {
 			return 0, ErrBadProto
 		}
-	}
+		name := input[start:i]
+		i++
 
-	if !ok {
-		return 0, ErrMissingData
-	}
-
-	var readN bool
-
-	ok = false
-loop:
-	for i := version; i < total; i++ {
-		c := input[i]
-
-		switch readN {
-		case false:
-			switch c {
-			case '\r':
-				hp.Version = input[version:i]
-				readN = true
-			case '\n':
-				hp.Version = input[version:i]
-				headers = i + 1
-				ok = true
-				break loop
-			}
-		case true:
-			if c != '\n' {
-				return 0, ErrBadProto
-			}
-			headers = i + 1
-			ok = true
-			break loop
+		for i < total && (input[i] == ' ' || input[i] == '\t') {
+			i++
 		}
-	}
-
-	if !ok {
-		return 0, ErrMissingData
-	}
-
-	var headerName []byte
-
-	state := eNextHeader
-
-	start := headers
-
-	for i := headers; i < total; i++ {
-		c := input[i]
-
-		switch state {
-		case eNextHeader:
-			switch c {
-			case '\r':
-				state = eNextHeaderN
-			case '\n':
-				return i + 1, nil
-			case ' ', '\t':
-				if len(hp.Headers) == 0 {
-					return 0, ErrBadProto
-				}
-				state = eMLHeaderStart
-			default:
-				start = i
-				state = eHeader
-			}
-		case eNextHeaderN:
-			if c != '\n' {
-				return 0, ErrBadProto
-			}
-
-			return i + 1, nil
-		case eHeader:
-			switch c {
-			case ':':
-				headerName = input[start:i]
-				state = eHeaderValueSpace
-			case ' ', '\t', '\r', '\n':
-				return 0, ErrBadProto
-			}
-		case eHeaderValueSpace:
-			if c == ' ' || c == '\t' {
-				continue
-			}
-
-			start = i
-			state = eHeaderValue
-			fallthrough
-		case eHeaderValue:
-			switch c {
-			case '\r':
-				state = eHeaderValueN
-			case '\n':
-				state = eNextHeader
-			default:
-				continue
-			}
-
-			hp.Headers = append(hp.Headers, Header{headerName, trimRight(input[start:i])})
-		case eHeaderValueN:
-			if c != '\n' {
-				return 0, ErrBadProto
-			}
-			state = eNextHeader
-
-		case eMLHeaderStart:
-			if c == ' ' || c == '\t' {
-				continue
-			}
-
-			start = i
-			state = eMLHeaderValue
-			fallthrough
-		case eMLHeaderValue:
-			switch c {
-			case '\r':
-				state = eHeaderValueN
-			case '\n':
-				state = eNextHeader
-			default:
-				continue
-			}
-
-			last := &hp.Headers[len(hp.Headers)-1]
-			cont := trimRight(input[start:i])
-
-			newheader := make([]byte, 0, len(last.Value)+1+len(cont))
-			newheader = append(newheader, last.Value...)
-			newheader = append(newheader, ' ')
-			newheader = append(newheader, cont...)
-
-			last.Value = newheader
+		start = i
+		for i < total && fieldByte[input[i]] {
+			i++
 		}
-	}
+		value := trimRight(input[start:i])
 
-	return 0, ErrMissingData
+		if i, err = lineEnd(input, i); err != nil {
+			return 0, err
+		}
+		hp.Headers = append(hp.Headers, Header{name, value})
+	}
+}
+
+// lineEnd returns the offset after the line ending at input[i]: CRLF or a
+// bare LF.
+func lineEnd(input []byte, i int) (int, error) {
+	switch {
+	case i == len(input):
+		return 0, ErrMissingData
+	case input[i] == '\n':
+		return i + 1, nil
+	case input[i] != '\r':
+		return 0, ErrBadProto
+	case i+1 == len(input):
+		return 0, ErrMissingData
+	case input[i+1] != '\n':
+		return 0, ErrBadProto
+	}
+	return i + 2, nil
 }
 
 func trimRight(b []byte) []byte {

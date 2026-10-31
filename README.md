@@ -6,14 +6,26 @@ goroutine per connection.
 
 - Requests are parsed in place by an embedded copy of the
   [wildcat](https://github.com/evanphx/wildcat) parser: no allocations on the
-  hot path.
-- Routing with static segments, `:param` and `*wildcard`.
-- Keep-alive and pipelining.
+  hot path. Parsing is strict (RFC 9112): control characters, malformed
+  methods, versions and header names, folded headers, a missing or repeated
+  `Host`, and `Transfer-Encoding` together with `Content-Length` are refused.
+- Routing with static segments, `:param` and `*wildcard`, middleware, route
+  groups and trailing-slash redirects. Paths are percent-decoded; query and
+  form parameters are decoded on demand.
+- Keep-alive and pipelining, chunked request bodies, `Expect: 100-continue`,
+  and bodies too large to buffer streamed to the handler piece by piece.
+- `Ctx.Async` runs a slow handler on a goroutine pool without blocking the
+  event loop; responses keep the order of pipelined requests.
+- Timeouts against slow and idle clients, a cap on unread responses, and a
+  graceful `Shutdown` that waits for the requests in flight.
+- HTTPS with `crypto/tls`, served by the same HTTP and WebSocket code.
 - `Ctx.Upgrade` turns the connection into a WebSocket. The frames travel on
   the same gnet connection, so an open WebSocket costs about 1 KB of memory.
+  permessage-deflate (RFC 7692), streaming of large messages in both
+  directions.
 - The [Autobahn TestSuite](https://github.com/crossbario/autobahn-testsuite)
-  passes 298 cases with no failures (`autobahn/run.sh`). Cases 12.* and 13.*
-  test permessage-deflate, which wisp does not implement, so they are skipped.
+  passes with no failures (`autobahn/run.sh`); the compression cases (12.*,
+  13.*) are now enabled too.
 
 ## Example
 
@@ -22,24 +34,43 @@ package main
 
 import (
 	"log"
+	"time"
 
 	"github.com/panjf2000/gnet/v2"
 
 	"github.com/panzarasa/wisp"
 )
 
+func logger(next wisp.Handler) wisp.Handler {
+	return func(c *wisp.Ctx) {
+		start := time.Now()
+		next(c)
+		log.Printf("%s %s %v", c.Method, c.Path, time.Since(start))
+	}
+}
+
 func main() {
 	r := wisp.NewRouter()
+	r.Use(logger)
 
 	r.GET("/", func(c *wisp.Ctx) {
 		c.Text(200, "Hello, World!")
 	})
 
-	r.GET("/users/:id", func(c *wisp.Ctx) {
+	api := r.Group("/api")
+	api.GET("/users/:id", func(c *wisp.Ctx) {
 		c.Bytes(200, wisp.MIMETextPlain, append([]byte("user "), c.Param("id")...))
+	})
+	api.GET("/report", func(c *wisp.Ctx) {
+		// Blocking work: off the event loop.
+		c.Async(func(c *wisp.Ctx) {
+			time.Sleep(100 * time.Millisecond) // a database, another service...
+			c.Text(200, "report for "+string(c.QueryParam("year")))
+		})
 	})
 
 	echo := &wisp.WSHandler{
+		Compression: &wisp.WSCompression{},
 		OnMessage: func(ws *wisp.WSConn, typ wisp.WSMessageType, data []byte) {
 			ws.Send(typ, data)
 		},
@@ -49,25 +80,96 @@ func main() {
 	})
 
 	srv := &wisp.Server{Handler: r.Serve}
+	go func() {
+		log.Fatal(srv.ListenAndServeTLS(":8443", "cert.pem", "key.pem"))
+	}()
 	log.Fatal(srv.ListenAndServe(":8080", gnet.WithMulticore(true), gnet.WithReuseAddr(true)))
 }
 ```
 
-`cmd/server` is a complete example, with a chat room and graceful shutdown.
+`cmd/server` is a complete example, with a chat room (open `/chat` in two
+tabs), TLS flags and graceful shutdown.
+
+## Handlers
 
 Handlers run on the event loops. A handler that blocks stalls every
-connection on its loop, so hand slow work to a goroutine pool.
+connection on its loop: it calls `c.Async(fn)`, and `fn` runs on a pool of
+goroutines (at most `Server.MaxAsync` at once, 503 beyond) with its own copy
+of the request. The requests a client pipelines behind it wait for its
+response.
+
+Every `[]byte` a `Ctx` returns (`Path`, `Param`, `Header`, `Body`,
+`QueryParam`...) points into the connection's buffers and is valid only until
+the handler returns.
+
+Bodies up to `Server.MaxBodyBytes` (4 MiB) are buffered and handed over whole
+in `c.Body`. A larger `Content-Length` goes to `Server.StreamHandler`, which
+can take the body piece by piece with `c.ReceiveBody(&wisp.BodyStream{...})`.
+
+## Timeouts and limits
+
+| `Server` field | default | |
+|---|---:|---|
+| `ReadHeaderTimeout` | 10 s | first byte of a request to the end of its header; also the TLS handshake (slowloris) |
+| `ReadTimeout` | 60 s | first byte of a request to the end of its body |
+| `WriteTimeout` | 30 s | how long responses may wait for a client that does not read |
+| `IdleTimeout` | 60 s | keep-alive connection waiting for its next request |
+| `MaxHeaderBytes` | 64 KiB | 431 beyond |
+| `MaxBodyBytes` | 4 MiB | 413 beyond, or `StreamHandler` |
+| `MaxOutboundBytes` | 4 MiB | unread responses; past it pipelined requests stay unread |
+| `MaxAsync` | 10 000 | handlers running with `Async` |
+
+A request that times out gets a 408. A negative timeout disables it. The
+checks run as often as the shortest timeout needs, so sub-second timeouts
+work, for WebSocket connections too.
+
+`Shutdown(ctx)` stops accepting, closes idle connections, lets the requests
+in flight finish (their responses carry `Connection: close`), sends a 1001
+close frame to WebSocket peers, and returns once all are gone or `ctx`
+expires.
+
+## TLS
+
+gnet has no TLS, so HTTPS follows the design of
+[maurice2k/tcpserver](https://github.com/maurice2k/tcpserver):
+
+- `wisp.Listen` sets `SO_REUSEPORT`, and on Linux `TCP_FASTOPEN` and
+  `TCP_DEFER_ACCEPT`, so the server only wakes up once the client's first
+  bytes (the ClientHello) have arrived.
+- Several goroutines accept on the listener (`Server.TLSAcceptLoops`), and each
+  connection is handed to a pool of goroutines and wrapped with `tls.Server`.
+
+From there on, a TLS connection behaves like a gnet connection: a reader
+goroutine turns what it decrypts into events, a writer goroutine sends the
+responses, and the HTTP and WebSocket code is the same. `ListenAndServeTLS`
+loads a certificate pair; `ServeTLS(ln, config)` takes any `tls.Config`.
+`c.IsTLS()` tells the two apart. ALPN offers `http/1.1`.
+
+## WebSocket
+
+- `WSHandler.Compression` enables permessage-deflate for clients that offer
+  it. By default every message is compressed on its own, so the flate state
+  comes from pools and an idle connection keeps none of it.
+  `ContextTakeover: true` compresses better but keeps a compressor per
+  connection.
+- `WSConn.NextWriter(typ)` sends a message as a series of frames, for
+  messages too large to build in memory.
+- `WSHandler.OnFrame` receives each frame as it arrives instead of whole
+  messages; `MaxMessageBytes` then limits a frame.
+- Idle peers are pinged, then dropped (`IdleTimeout`); `Send` can be called
+  from any goroutine.
 
 ## Not supported yet
 
-- TLS and HTTP/2
-- chunked request bodies (answered with 501)
-- percent-decoding of paths
-- idle and read timeouts on HTTP connections (WebSocket connections have their
-  own)
-- permessage-deflate
+- HTTP/2
+- transfer codings other than `chunked`; chunked bodies larger than
+  `MaxBodyBytes` (only `Content-Length` bodies can be streamed)
 
 ## Benchmarks
+
+These figures were measured before the release that added timeouts, TLS,
+`Async` and compression; the hot path barely changed (parsing a request got
+faster, a WebSocket frame costs 2 ns more).
 
 Every server runs on **one core** (one event loop for wisp). The load
 generator runs on three other cores of the same machine, over loopback, so
@@ -181,7 +283,7 @@ parameters.
 ## Layout
 
 ```
-*.go             package wisp: server, router, WebSocket, MIME constants (mime.go)
+*.go             package wisp: server, router, WebSocket, TLS (tls.go), MIME constants (mime.go)
 wildcat/         embedded HTTP request parser (BSD 2-Clause, see wildcat/LICENSE)
 cmd/server       example server, also the benchmark target
 cmd/baseline     gnet alone, as a reference for the HTTP layer's cost

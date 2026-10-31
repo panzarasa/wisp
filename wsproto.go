@@ -53,17 +53,17 @@ func validCloseCode(code int) bool {
 	return false
 }
 
-// appendFrameHeader appends the header of an unmasked, final frame with a
-// payload of n bytes: servers never mask (section 5.1) and this one never
-// fragments what it sends.
-func appendFrameHeader(b []byte, op byte, n int) []byte {
+// appendFrameHeader appends the header of an unmasked frame with a payload
+// of n bytes (servers never mask, section 5.1); b0 is its first byte: FIN,
+// RSV1 and the opcode.
+func appendFrameHeader(b []byte, b0 byte, n int) []byte {
 	switch {
 	case n < 126:
-		return append(b, 0x80|op, byte(n))
+		return append(b, b0, byte(n))
 	case n <= 0xFFFF:
-		return append(b, 0x80|op, 126, byte(n>>8), byte(n))
+		return append(b, b0, 126, byte(n>>8), byte(n))
 	default:
-		b = append(b, 0x80|op, 127)
+		b = append(b, b0, 127)
 		return binary.BigEndian.AppendUint64(b, uint64(n))
 	}
 }

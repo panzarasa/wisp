@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>wisp chat</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #fff; --ink: #1d2330; --muted: #6b7385;
+    --line: #dde1e8; --accent: #3b5bdb; --mine: #e7ecff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #12151b; --panel: #1b1f27; --ink: #e6e9ef; --muted: #8d95a8;
+      --line: #2b313c; --accent: #7b93ff; --mine: #252d45;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+    display: flex; justify-content: center;
+  }
+  main {
+    width: 100%; max-width: 720px; height: 100dvh;
+    display: flex; flex-direction: column; padding: 16px; gap: 12px;
+  }
+  header { display: flex; align-items: baseline; gap: 12px; }
+  h1 { font-size: 18px; margin: 0; }
+  #status { color: var(--muted); font-size: 13px; }
+  #status.on::before { content: "● "; color: #2f9e44; }
+  #status.off::before { content: "● "; color: #e03131; }
+  #log {
+    flex: 1; overflow-y: auto; margin: 0; padding: 12px; list-style: none;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+  }
+  #log li { padding: 4px 8px; border-radius: 6px; overflow-wrap: anywhere; }
+  #log li.mine { background: var(--mine); }
+  #log li.info { color: var(--muted); font-style: italic; }
+  #log b { font-weight: 600; }
+  form { display: flex; gap: 8px; }
+  input {
+    font: inherit; color: inherit; background: var(--panel);
+    border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; min-width: 0;
+  }
+  #name { width: 9em; }
+  #text { flex: 1; }
+  button {
+    font: inherit; border: 0; border-radius: 6px; padding: 8px 16px;
+    background: var(--accent); color: #fff; cursor: pointer;
+  }
+  button:disabled { opacity: .5; cursor: default; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>wisp chat</h1>
+    <span id="status" class="off">connecting…</span>
+  </header>
+  <ul id="log" aria-live="polite"></ul>
+  <form id="form" autocomplete="off">
+    <input id="name" placeholder="name" maxlength="32" aria-label="Name">
+    <input id="text" placeholder="message" maxlength="2000" aria-label="Message" autofocus>
+    <button id="send" disabled>Send</button>
+  </form>
+</main>
+<script>
+// Messages are "name\ttext": the server relays them to everyone as they are.
+const log = document.getElementById("log");
+const status = document.getElementById("status");
+const form = document.getElementById("form");
+const nameInput = document.getElementById("name");
+const textInput = document.getElementById("text");
+const send = document.getElementById("send");
+
+nameInput.value = localStorage.getItem("wisp-chat-name") || "guest" + Math.floor(Math.random() * 1000);
+nameInput.addEventListener("change", () => localStorage.setItem("wisp-chat-name", nameInput.value));
+
+function add(text, cls, who) {
+  const li = document.createElement("li");
+  if (cls) li.className = cls;
+  if (who) {
+    const b = document.createElement("b");
+    b.textContent = who + ": ";
+    li.append(b);
+  }
+  li.append(text);
+  const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+  log.append(li);
+  if (atBottom) log.scrollTop = log.scrollHeight;
+}
+
+let ws, retry = 500;
+function connect() {
+  ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws/chat");
+  ws.onopen = () => {
+    retry = 500;
+    status.textContent = "connected";
+    status.className = "on";
+    send.disabled = false;
+  };
+  ws.onmessage = (e) => {
+    const [who, ...rest] = String(e.data).split("\t");
+    const text = rest.join("\t");
+    add(text, who === nameInput.value ? "mine" : "", who);
+  };
+  ws.onclose = (e) => {
+    send.disabled = true;
+    status.className = "off";
+    status.textContent = "disconnected (" + e.code + "), retrying…";
+    setTimeout(connect, retry);
+    retry = Math.min(retry * 2, 10000);
+  };
+}
+connect();
+
+form.addEventListener("submit", (e) => {
+  e.preventDefault();
+  const text = textInput.value.trim();
+  if (!text || ws.readyState !== WebSocket.OPEN) return;
+  ws.send((nameInput.value.trim() || "guest").replaceAll("\t", " ") + "\t" + text);
+  textInput.value = "";
+});
+
+add("Open this page in a second tab to talk to yourself.", "info");
+</script>
+</body>
+</html>

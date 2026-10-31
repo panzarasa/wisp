@@ -20,16 +20,40 @@ import (
 // Literal segments win over ":name", which wins over "*name"; when the
 // preferred branch does not lead to a route the next one is tried, so
 // "/users/me/settings" and "/users/:id" can coexist. Matching is exact:
-// "/users" and "/users/" are different paths.
+// "/users" and "/users/" are different paths, but see RedirectTrailingSlash.
 //
-// Routes must be registered before the server starts: lookups take no lock.
+// Middleware added with Use wraps every request; a Group registers routes
+// under a common prefix, wrapped in middleware of its own.
+//
+// Routes and middleware must be registered before the server starts: lookups
+// take no lock.
 type Router struct {
 	methods map[string]*methodRoutes
+	mws     []Middleware
+	chain   Handler // dispatch wrapped in mws; nil without middleware
 
 	// NotFound handles requests that match no route. The default answers 404,
 	// or 405 with an Allow header if the path exists for other methods.
 	NotFound Handler
+
+	// RedirectTrailingSlash redirects a request that matches no route to the
+	// same path with the trailing slash added or removed, if that matches
+	// one: 301 for GET and HEAD, 308 (which keeps the method and body) for
+	// the others. NewRouter enables it.
+	RedirectTrailingSlash bool
 }
+
+// Middleware wraps a handler: it may act before and after calling next, or
+// answer itself and not call it.
+//
+//	func logger(next wisp.Handler) wisp.Handler {
+//		return func(c *wisp.Ctx) {
+//			start := time.Now()
+//			next(c)
+//			log.Printf("%s %s %v", c.Method, c.Path, time.Since(start))
+//		}
+//	}
+type Middleware func(next Handler) Handler
 
 type methodRoutes struct {
 	// Patterns without parameters, by full path: the common case skips the tree.
@@ -47,8 +71,80 @@ type node struct {
 }
 
 func NewRouter() *Router {
-	return &Router{methods: make(map[string]*methodRoutes)}
+	return &Router{methods: make(map[string]*methodRoutes), RedirectTrailingSlash: true}
 }
+
+// Use adds middleware that wraps every request the Router serves, matched or
+// not; the first one added runs first.
+func (r *Router) Use(mws ...Middleware) {
+	r.mws = append(r.mws, mws...)
+	r.chain = wrap(r.dispatch, r.mws)
+}
+
+// wrap returns h wrapped in mws, the first one outermost.
+func wrap(h Handler, mws []Middleware) Handler {
+	for i := len(mws) - 1; i >= 0; i-- {
+		h = mws[i](h)
+	}
+	return h
+}
+
+// Group returns a Group of routes under prefix ("/api"), wrapped in mws.
+func (r *Router) Group(prefix string, mws ...Middleware) *Group {
+	return newGroup(r, "", nil, prefix, mws)
+}
+
+// Group registers routes under a common path prefix, each wrapped in the
+// group's middleware (after the Router's).
+type Group struct {
+	r      *Router
+	prefix string
+	mws    []Middleware
+}
+
+func newGroup(r *Router, base string, baseMws []Middleware, prefix string, mws []Middleware) *Group {
+	if !strings.HasPrefix(prefix, "/") {
+		panic(fmt.Sprintf("wisp: group prefix %q must begin with '/'", prefix))
+	}
+	return &Group{
+		r:      r,
+		prefix: base + strings.TrimRight(prefix, "/"),
+		mws:    append(append([]Middleware(nil), baseMws...), mws...),
+	}
+}
+
+// Group returns a group nested in g: its prefix follows g's, and its
+// middleware runs after g's.
+func (g *Group) Group(prefix string, mws ...Middleware) *Group {
+	return newGroup(g.r, g.prefix, g.mws, prefix, mws)
+}
+
+// Use adds middleware to the routes registered on g from now on.
+func (g *Group) Use(mws ...Middleware) {
+	g.mws = append(g.mws, mws...)
+}
+
+// Handle registers h for method and the group's prefix followed by pattern;
+// an empty pattern is the prefix itself.
+func (g *Group) Handle(method, pattern string, h Handler) {
+	if pattern != "" && !strings.HasPrefix(pattern, "/") {
+		panic(fmt.Sprintf("wisp: pattern %q must begin with '/'", pattern))
+	}
+	full := g.prefix + pattern
+	if full == "" {
+		full = "/"
+	}
+	if h != nil {
+		h = wrap(h, g.mws)
+	}
+	g.r.Handle(method, full, h)
+}
+
+func (g *Group) GET(pattern string, h Handler)    { g.Handle("GET", pattern, h) }
+func (g *Group) POST(pattern string, h Handler)   { g.Handle("POST", pattern, h) }
+func (g *Group) PUT(pattern string, h Handler)    { g.Handle("PUT", pattern, h) }
+func (g *Group) PATCH(pattern string, h Handler)  { g.Handle("PATCH", pattern, h) }
+func (g *Group) DELETE(pattern string, h Handler) { g.Handle("DELETE", pattern, h) }
 
 func (r *Router) GET(pattern string, h Handler)    { r.Handle("GET", pattern, h) }
 func (r *Router) POST(pattern string, h Handler)   { r.Handle("POST", pattern, h) }
@@ -130,22 +226,100 @@ func (r *Router) Handle(method, pattern string, h Handler) {
 	}
 }
 
-// Serve dispatches ctx to the matching handler. It is the Handler to give to
-// a Server.
+// Serve dispatches ctx to the matching handler, through the middleware. It
+// is the Handler to give to a Server.
 func (r *Router) Serve(c *Ctx) {
+	if r.chain != nil {
+		r.chain(c)
+		return
+	}
+	r.dispatch(c)
+}
+
+var methodGET = []byte("GET")
+
+func (r *Router) dispatch(c *Ctx) {
 	h := r.lookup(c.Method, c.Path, c)
 	if h == nil && string(c.Method) == "HEAD" {
-		if h = r.lookup([]byte("GET"), c.Path, c); h != nil {
+		if h = r.lookup(methodGET, c.Path, c); h != nil {
 			c.head = true
 		}
 	}
-	if h == nil {
-		h = r.NotFound
-		if h == nil {
-			h = r.notFound
-		}
+	if h != nil {
+		h(c)
+		return
+	}
+	if string(c.Path) == "*" && string(c.Method) == "OPTIONS" {
+		r.optionsAll(c)
+		return
+	}
+	if r.RedirectTrailingSlash && r.redirectSlash(c) {
+		return
+	}
+	if h = r.NotFound; h == nil {
+		h = r.notFound
 	}
 	h(c)
+}
+
+// redirectSlash redirects c if its path with the trailing slash toggled
+// matches a route.
+func (r *Router) redirectSlash(c *Ctx) bool {
+	p := c.Path
+	// "//host" in Location would be another site.
+	if len(p) < 2 || p[0] != '/' || p[1] == '/' {
+		return false
+	}
+	var buf [256]byte
+	var alt []byte
+	if p[len(p)-1] == '/' {
+		alt = p[:len(p)-1]
+	} else {
+		alt = append(append(buf[:0], p...), '/')
+	}
+	found := r.lookup(c.Method, alt, c) != nil ||
+		string(c.Method) == "HEAD" && r.lookup(methodGET, alt, c) != nil
+	c.nparams = 0
+	if !found {
+		return false
+	}
+
+	raw := c.RawPath
+	if raw == nil {
+		raw = c.Path
+	}
+	loc := make([]byte, 0, len(raw)+1+len(c.Query)+1)
+	if raw[len(raw)-1] == '/' {
+		loc = append(loc, raw[:len(raw)-1]...)
+	} else {
+		loc = append(append(loc, raw...), '/')
+	}
+	if len(c.Query) > 0 {
+		loc = append(append(loc, '?'), c.Query...)
+	}
+	status := 308
+	if m := string(c.Method); m == "GET" || m == "HEAD" {
+		status = 301
+	}
+	c.SetHeader("Location", string(loc))
+	c.Text(status, statusText(status))
+	return true
+}
+
+// optionsAll answers "OPTIONS *" with the methods of the server.
+func (r *Router) optionsAll(c *Ctx) {
+	allow := []string{"OPTIONS"}
+	for method := range r.methods {
+		if method != "OPTIONS" {
+			allow = append(allow, method)
+		}
+	}
+	if r.methods["GET"] != nil && r.methods["HEAD"] == nil {
+		allow = append(allow, "HEAD")
+	}
+	sort.Strings(allow)
+	c.SetHeader("Allow", strings.Join(allow, ", "))
+	c.Status(204)
 }
 
 func (r *Router) lookup(method, path []byte, c *Ctx) Handler {

@@ -52,8 +52,7 @@ func wsRequest(path string, lines ...string) string {
 // rawFrame builds a frame with the first byte as given (FIN, RSV, opcode),
 // masked with a random key unless masked is false.
 func rawFrame(b0 byte, payload []byte, masked bool) []byte {
-	b := appendFrameHeader(nil, 0, len(payload))
-	b[0] = b0
+	b := appendFrameHeader(nil, b0, len(payload))
 	if !masked {
 		return append(b, payload...)
 	}
@@ -81,6 +80,7 @@ func closePayload(code int, reason string) []byte {
 
 type wsFrame struct {
 	fin     bool
+	rsv1    bool // compressed
 	op      byte
 	payload []byte
 }
@@ -94,8 +94,8 @@ func readServerFrame(r io.Reader) (wsFrame, error) {
 	if h[1]&0x80 != 0 {
 		return wsFrame{}, errors.New("server frame is masked")
 	}
-	if h[0]&0x70 != 0 {
-		return wsFrame{}, errors.New("server frame has RSV bits")
+	if h[0]&0x30 != 0 {
+		return wsFrame{}, errors.New("server frame has RSV2 or RSV3 set")
 	}
 	n := uint64(h[1] & 0x7F)
 	switch n {
@@ -110,7 +110,7 @@ func readServerFrame(r io.Reader) (wsFrame, error) {
 		}
 		n = binary.BigEndian.Uint64(h[2:])
 	}
-	f := wsFrame{fin: h[0]&0x80 != 0, op: h[0] & 0x0F, payload: make([]byte, n)}
+	f := wsFrame{fin: h[0]&0x80 != 0, rsv1: h[0]&0x40 != 0, op: h[0] & 0x0F, payload: make([]byte, n)}
 	_, err := io.ReadFull(r, f.payload)
 	return f, err
 }
@@ -172,7 +172,7 @@ func TestUnmask(t *testing.T) {
 
 func TestAppendFrameHeader(t *testing.T) {
 	for _, n := range []int{0, 1, 125, 126, 127, 65535, 65536, 1 << 20} {
-		b := appendFrameHeader(nil, opBinary, n)
+		b := appendFrameHeader(nil, 0x80|opBinary, n)
 		b = append(b, make([]byte, n)...)
 		f, err := readServerFrame(bytes.NewReader(b))
 		if err != nil || !f.fin || f.op != opBinary || len(f.payload) != n {
@@ -253,8 +253,10 @@ func TestWSHandshake(t *testing.T) {
 			if len(resps) != 1 || resps[0].StatusCode != tc.status {
 				t.Fatalf("got %d responses %v, want status %d", len(resps), resps, tc.status)
 			}
-			// HTTP/1.0 without keep-alive closes after any response.
-			if consumed != len(tc.request) || closed != strings.Contains(tc.request, "HTTP/1.0") {
+			// HTTP/1.0 without keep-alive closes after any response; a
+			// request without Host is malformed and closes before it is read.
+			noHost := !strings.Contains(tc.request, "Host:")
+			if consumed != len(tc.request) && !noHost || closed != (noHost || strings.Contains(tc.request, "HTTP/1.0")) {
 				t.Fatalf("consumed %d of %d, closed %v", consumed, len(tc.request), closed)
 			}
 			if tc.header != "" {
@@ -324,7 +326,7 @@ func TestWSHandshakeStopsHTTP(t *testing.T) {
 
 func TestWSHandshakeDuringShutdown(t *testing.T) {
 	s := &Server{Handler: upgradeHandler(&WSHandler{})}
-	s.wsShutdown.Store(true)
+	s.shutdown.Store(true)
 	resps, _, _, _ := feed(t, s, s.getState(), wsRequest("/"))
 	if resps[0].StatusCode != 503 {
 		t.Fatalf("status %d", resps[0].StatusCode)

@@ -104,14 +104,14 @@ func TestProcessRequestData(t *testing.T) {
 	s, st := newTestState(t)
 
 	tests := []struct{ req, want string }{
-		{"GET /users/42 HTTP/1.1\r\n\r\n", "42"},
-		{"GET /users/42?full=1 HTTP/1.1\r\n\r\n", "42"},
-		{"GET /query?a=1&b=2 HTTP/1.1\r\n\r\n", "a=1&b=2"},
-		{"GET /query HTTP/1.1\r\n\r\n", ""},
-		{"GET /agent HTTP/1.1\r\nUser-Agent: test/1.0\r\n\r\n", "test/1.0"},
-		{"POST /echo HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello", "hello"},
-		{"POST /echo HTTP/1.1\r\nContent-Length: 0\r\n\r\n", ""},
-		{"POST /echo HTTP/1.1\r\n\r\n", ""},
+		{"GET /users/42 HTTP/1.1\r\nHost: h\r\n\r\n", "42"},
+		{"GET /users/42?full=1 HTTP/1.1\r\nHost: h\r\n\r\n", "42"},
+		{"GET /query?a=1&b=2 HTTP/1.1\r\nHost: h\r\n\r\n", "a=1&b=2"},
+		{"GET /query HTTP/1.1\r\nHost: h\r\n\r\n", ""},
+		{"GET /agent HTTP/1.1\r\nHost: h\r\nUser-Agent: test/1.0\r\n\r\n", "test/1.0"},
+		{"POST /echo HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\nhello", "hello"},
+		{"POST /echo HTTP/1.1\r\nHost: h\r\nContent-Length: 0\r\n\r\n", ""},
+		{"POST /echo HTTP/1.1\r\nHost: h\r\n\r\n", ""},
 	}
 	for _, tt := range tests {
 		resps, bodies, consumed, closed := feed(t, s, st, tt.req)
@@ -128,9 +128,9 @@ func TestProcessPipelining(t *testing.T) {
 	s, st := newTestState(t)
 
 	// Three whole requests and the beginning of a fourth.
-	whole := "GET /users/1 HTTP/1.1\r\n\r\n" +
-		"POST /echo HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc" +
-		"GET /users/3 HTTP/1.1\r\n\r\n"
+	whole := "GET /users/1 HTTP/1.1\r\nHost: h\r\n\r\n" +
+		"POST /echo HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\n\r\nabc" +
+		"GET /users/3 HTTP/1.1\r\nHost: h\r\n\r\n"
 	_, bodies, consumed, closed := feed(t, s, st, whole+"GET /users/4 HT")
 
 	if got := strings.Join(bodies, ","); got != "1,abc,3" {
@@ -144,7 +144,7 @@ func TestProcessPipelining(t *testing.T) {
 func TestProcessIncompleteRequest(t *testing.T) {
 	s, st := newTestState(t)
 
-	req := "POST /echo HTTP/1.1\r\nContent-Length: 10\r\n\r\n0123456789"
+	req := "POST /echo HTTP/1.1\r\nHost: h\r\nContent-Length: 10\r\n\r\n0123456789"
 
 	// Whatever the cut point, nothing is consumed or answered before the
 	// request is whole.
@@ -174,10 +174,10 @@ func TestProcessConnectionHandling(t *testing.T) {
 		req    string
 		closed bool
 	}{
-		{"GET / HTTP/1.1\r\n\r\n", false},
-		{"GET / HTTP/1.1\r\nConnection: close\r\n\r\n", true},
-		{"GET / HTTP/1.1\r\nConnection: Keep-Alive, Close\r\n\r\n", true},
-		{"GET / HTTP/1.1\r\nconnection: keep-alive\r\n\r\n", false},
+		{"GET / HTTP/1.1\r\nHost: h\r\n\r\n", false},
+		{"GET / HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n", true},
+		{"GET / HTTP/1.1\r\nHost: h\r\nConnection: Keep-Alive, Close\r\n\r\n", true},
+		{"GET / HTTP/1.1\r\nHost: h\r\nconnection: keep-alive\r\n\r\n", false},
 		{"GET / HTTP/1.0\r\n\r\n", true},
 		{"GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n", false},
 	}
@@ -193,7 +193,7 @@ func TestProcessConnectionHandling(t *testing.T) {
 	}
 
 	// Nothing after a request that closes the connection is served.
-	_, bodies, _, _ := feed(t, s, st, "GET /users/1 HTTP/1.1\r\nConnection: close\r\n\r\nGET /users/2 HTTP/1.1\r\n\r\n")
+	_, bodies, _, _ := feed(t, s, st, "GET /users/1 HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\nGET /users/2 HTTP/1.1\r\nHost: h\r\n\r\n")
 	if len(bodies) != 1 || bodies[0] != "1" {
 		t.Errorf("bodies = %q, want only the first response", bodies)
 	}
@@ -209,15 +209,15 @@ func TestProcessRejects(t *testing.T) {
 		status    int
 	}{
 		{"garbage", "\x16\x03\x01\x02\x00\r\n\r\n", 400},
-		{"no colon", "GET / HTTP/1.1\r\nNope\r\n\r\n", 400},
+		{"no colon", "GET / HTTP/1.1\r\nHost: h\r\nNope\r\n\r\n", 400},
 		{"http/2 preface", "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", 505},
-		{"bad content-length", "POST /echo HTTP/1.1\r\nContent-Length: abc\r\n\r\n", 400},
-		{"negative content-length", "POST /echo HTTP/1.1\r\nContent-Length: -1\r\n\r\n", 400},
-		{"conflicting content-length", "POST /echo HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nab", 400},
-		{"chunked", "POST /echo HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n", 501},
-		{"body too large", "POST /echo HTTP/1.1\r\nContent-Length: 1025\r\n\r\n", 413},
-		{"headers too large", "GET / HTTP/1.1\r\nX: " + strings.Repeat("a", 300) + "\r\n\r\n", 431},
-		{"headers too large, incomplete", "GET / HTTP/1.1\r\nX: " + strings.Repeat("a", 300), 431},
+		{"bad content-length", "POST /echo HTTP/1.1\r\nHost: h\r\nContent-Length: abc\r\n\r\n", 400},
+		{"negative content-length", "POST /echo HTTP/1.1\r\nHost: h\r\nContent-Length: -1\r\n\r\n", 400},
+		{"conflicting content-length", "POST /echo HTTP/1.1\r\nHost: h\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nab", 400},
+		{"transfer coding", "POST /echo HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n", 501},
+		{"body too large", "POST /echo HTTP/1.1\r\nHost: h\r\nContent-Length: 1025\r\n\r\n", 413},
+		{"headers too large", "GET / HTTP/1.1\r\nHost: h\r\nX: " + strings.Repeat("a", 300) + "\r\n\r\n", 431},
+		{"headers too large, incomplete", "GET / HTTP/1.1\r\nHost: h\r\nX: " + strings.Repeat("a", 300), 431},
 	}
 	for _, tt := range tests {
 		resps, _, _, closed := feed(t, s, st, tt.req)
@@ -231,7 +231,7 @@ func TestProcessRejects(t *testing.T) {
 	}
 
 	// Agreeing duplicates are harmless.
-	resps, bodies, _, _ := feed(t, s, st, "POST /echo HTTP/1.1\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\nab")
+	resps, bodies, _, _ := feed(t, s, st, "POST /echo HTTP/1.1\r\nHost: h\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\nab")
 	if len(resps) != 1 || resps[0].StatusCode != 200 || bodies[0] != "ab" {
 		t.Errorf("duplicate content-length: got %q", st.ctx.out)
 	}
@@ -240,24 +240,24 @@ func TestProcessRejects(t *testing.T) {
 func TestProcessResponses(t *testing.T) {
 	s, st := newTestState(t)
 
-	resps, bodies, _, _ := feed(t, s, st, "GET /silent HTTP/1.1\r\n\r\n")
+	resps, bodies, _, _ := feed(t, s, st, "GET /silent HTTP/1.1\r\nHost: h\r\n\r\n")
 	if resps[0].StatusCode != 204 || bodies[0] != "" || resps[0].Header.Get("Content-Length") != "" {
 		t.Errorf("handler without response: got %q, want a bare 204", st.ctx.out)
 	}
 
-	resps, bodies, _, _ = feed(t, s, st, "GET /twice HTTP/1.1\r\n\r\n")
+	resps, bodies, _, _ = feed(t, s, st, "GET /twice HTTP/1.1\r\nHost: h\r\n\r\n")
 	if len(resps) != 1 || resps[0].StatusCode != 200 || bodies[0] != "second" {
 		t.Errorf("second response must replace the first: got %q", st.ctx.out)
 	}
 
-	resps, _, _, _ = feed(t, s, st, "GET /header HTTP/1.1\r\n\r\n")
+	resps, _, _, _ = feed(t, s, st, "GET /header HTTP/1.1\r\nHost: h\r\n\r\n")
 	if resps[0].StatusCode != 204 || resps[0].Header.Get("X-Test") != "yes" {
 		t.Errorf("SetHeader: got %q", st.ctx.out)
 	}
 
 	// HEAD falls back to the GET route: same headers, no body.
 	st.ctx.out = st.ctx.out[:0]
-	s.serve(st, []byte("HEAD /users/12345 HTTP/1.1\r\n\r\n"))
+	s.serve(st, []byte("HEAD /users/12345 HTTP/1.1\r\nHost: h\r\n\r\n"))
 	if out := string(st.ctx.out); !strings.Contains(out, "Content-Length: 5\r\n") || !strings.HasSuffix(out, "\r\n\r\n") {
 		t.Errorf("HEAD: got %q", out)
 	}
@@ -266,7 +266,7 @@ func TestProcessResponses(t *testing.T) {
 func TestProcessExpectContinue(t *testing.T) {
 	s, st := newTestState(t)
 
-	head := "POST /echo HTTP/1.1\r\nContent-Length: 4\r\nExpect: 100-continue\r\n\r\n"
+	head := "POST /echo HTTP/1.1\r\nHost: h\r\nContent-Length: 4\r\nExpect: 100-continue\r\n\r\n"
 
 	st.ctx.out = st.ctx.out[:0]
 	consumed, _ := s.serve(st, []byte(head))
@@ -293,7 +293,7 @@ func TestProcessRecoversPanic(t *testing.T) {
 	log.SetOutput(io.Discard)
 	defer log.SetOutput(log.Writer())
 
-	resps, bodies, _, closed := feed(t, s, st, "GET /users/1 HTTP/1.1\r\n\r\nGET /panic HTTP/1.1\r\n\r\n")
+	resps, bodies, _, closed := feed(t, s, st, "GET /users/1 HTTP/1.1\r\nHost: h\r\n\r\nGET /panic HTTP/1.1\r\nHost: h\r\n\r\n")
 	if len(resps) != 2 || bodies[0] != "1" || resps[1].StatusCode != 500 || !closed {
 		t.Errorf("got %q, closed = %v; want the first response, then a 500 and a close", st.ctx.out, closed)
 	}
@@ -483,7 +483,7 @@ func TestServerRawConnection(t *testing.T) {
 	}
 
 	// A body arriving after its headers.
-	fmt.Fprint(conn, "POST /echo HTTP/1.1\r\nContent-Length: 11\r\n\r\nhello")
+	fmt.Fprint(conn, "POST /echo HTTP/1.1\r\nHost: h\r\nContent-Length: 11\r\n\r\nhello")
 	time.Sleep(20 * time.Millisecond)
 	fmt.Fprint(conn, " world")
 	if status, body := read(); status != 200 || body != "hello world" {
@@ -491,9 +491,9 @@ func TestServerRawConnection(t *testing.T) {
 	}
 
 	// Pipelined requests are answered in order, the last one cut in two.
-	fmt.Fprint(conn, "GET /users/1 HTTP/1.1\r\n\r\nGET /users/2 HTTP/1.1\r\n\r\nGET /users/3 HT")
+	fmt.Fprint(conn, "GET /users/1 HTTP/1.1\r\nHost: h\r\n\r\nGET /users/2 HTTP/1.1\r\nHost: h\r\n\r\nGET /users/3 HT")
 	time.Sleep(20 * time.Millisecond)
-	fmt.Fprint(conn, "TP/1.1\r\n\r\n")
+	fmt.Fprint(conn, "TP/1.1\r\nHost: h\r\n\r\n")
 	for _, want := range []string{"1", "2", "3"} {
 		if status, body := read(); status != 200 || body != want {
 			t.Fatalf("pipelining: %d %q, want 200 %q", status, body, want)
@@ -501,7 +501,7 @@ func TestServerRawConnection(t *testing.T) {
 	}
 
 	// Connection: close is honoured: the response, then EOF.
-	fmt.Fprint(conn, "GET / HTTP/1.1\r\nConnection: close\r\n\r\n")
+	fmt.Fprint(conn, "GET / HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n")
 	if status, body := read(); status != 200 || body != "Hello, World!" {
 		t.Fatalf("connection close: %d %q", status, body)
 	}

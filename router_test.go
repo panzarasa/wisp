@@ -3,6 +3,8 @@ package wisp
 import (
 	"strings"
 	"testing"
+
+	"github.com/panzarasa/wisp/wildcat"
 )
 
 // route registers a handler that answers with name, so a test can tell which
@@ -149,6 +151,139 @@ func TestRouterInvalidPatterns(t *testing.T) {
 				}
 			}()
 			tt.register(NewRouter())
+		}()
+	}
+}
+
+func TestRouterRedirectTrailingSlash(t *testing.T) {
+	r := NewRouter()
+	route(r, "GET", "/docs/", "docs")
+	route(r, "GET", "/users/:id", "user")
+	route(r, "POST", "/items", "items")
+	route(r, "GET", "/static/*file", "static")
+	route(r, "GET", "/exact", "exact")
+	route(r, "GET", "/exact/", "exact-slash")
+
+	tests := []struct {
+		method, raw, query string
+		status             int
+		location           string
+	}{
+		{"GET", "/docs", "", 301, "/docs/"},
+		{"HEAD", "/docs", "", 301, "/docs/"},
+		{"GET", "/users/42/", "a=1&b", 301, "/users/42?a=1&b"},
+		{"POST", "/items/", "", 308, "/items"},
+		{"GET", "/static", "", 301, "/static/"},
+		{"GET", "/caf%C3%A9/", "", 404, ""},
+		{"GET", "/exact", "", 200, ""},
+		{"GET", "/exact/", "", 200, ""},
+		{"PUT", "/items/", "", 404, ""},
+		{"GET", "//docs", "", 404, ""},
+		{"GET", "/", "", 404, ""},
+	}
+	for _, tt := range tests {
+		c := &Ctx{Method: []byte(tt.method), RawPath: []byte(tt.raw), Query: []byte(tt.query)}
+		c.Path = c.RawPath
+		if strings.Contains(tt.raw, "%") {
+			c.Path, _ = unescapePath(nil, c.RawPath)
+		}
+		r.Serve(c)
+		resp := string(c.out)
+		status, _ := splitResponse(t, c.out)
+		if status != tt.status || tt.location != "" && !strings.Contains(resp, "\r\nLocation: "+tt.location+"\r\n") {
+			t.Errorf("%s %s?%s: got\n%s", tt.method, tt.raw, tt.query, resp)
+		}
+		if c.nparams != 0 && status != 200 {
+			t.Errorf("%s %s: %d params left", tt.method, tt.raw, c.nparams)
+		}
+	}
+
+	r.RedirectTrailingSlash = false
+	c := &Ctx{Method: []byte("GET"), Path: []byte("/docs")}
+	r.Serve(c)
+	if status, _ := splitResponse(t, c.out); status != 404 {
+		t.Errorf("redirect disabled: %d", status)
+	}
+}
+
+func TestRouterOptionsStar(t *testing.T) {
+	r := testRouter()
+	c := &Ctx{Method: []byte("OPTIONS"), Path: []byte("*")}
+	r.Serve(c)
+	if status, _ := splitResponse(t, c.out); status != 204 || !strings.Contains(string(c.out), "\r\nAllow: DELETE, GET, HEAD, OPTIONS, POST\r\n") {
+		t.Errorf("got\n%s", c.out)
+	}
+}
+
+// tag is a middleware that records its name on the way in and out.
+func tag(trace *[]string, name string) Middleware {
+	return func(next Handler) Handler {
+		return func(c *Ctx) {
+			*trace = append(*trace, name)
+			next(c)
+			*trace = append(*trace, "/"+name)
+		}
+	}
+}
+
+func TestRouterMiddleware(t *testing.T) {
+	var trace []string
+	r := NewRouter()
+	r.Use(tag(&trace, "a"), tag(&trace, "b"))
+	route(r, "GET", "/", "root")
+
+	api := r.Group("/api/", tag(&trace, "api"))
+	api.GET("", func(c *Ctx) { trace = append(trace, "index"); c.Text(200, "api") })
+	api.GET("/users/:id", func(c *Ctx) { trace = append(trace, "user"); c.Bytes(200, MIMETextPlain, c.Param("id")) })
+	v2 := api.Group("/v2", tag(&trace, "v2"))
+	api.Use(tag(&trace, "late")) // only for the routes registered from now on
+	v2.GET("/x", func(c *Ctx) { trace = append(trace, "x"); c.Text(200, "x") })
+	api.GET("/y", func(c *Ctx) { trace = append(trace, "y"); c.Text(200, "y") })
+
+	auth := r.Group("/admin", func(next Handler) Handler {
+		return func(c *Ctx) {
+			if string(c.Header("Authorization")) == "" {
+				c.Text(401, "no")
+				return
+			}
+			next(c)
+		}
+	})
+	auth.GET("/", func(c *Ctx) { c.Text(200, "admin") })
+
+	tests := []struct {
+		path, body, trace string
+	}{
+		{"/", "root", "a b /b /a"},
+		{"/api", "api", "a b api index /api /b /a"},
+		{"/api/users/7", "7", "a b api user /api /b /a"},
+		{"/api/v2/x", "x", "a b api v2 x /v2 /api /b /a"},
+		{"/api/y", "y", "a b api late y /late /api /b /a"},
+		{"/nope", "Not Found", "a b /b /a"},
+		{"/admin/", "no", "a b /b /a"},
+	}
+	for _, tt := range tests {
+		trace = nil
+		c := &Ctx{Method: []byte("GET"), Path: []byte(tt.path), req: &wildcat.HTTPParser{}}
+		r.Serve(c)
+		_, body := splitResponse(t, c.out)
+		if body != tt.body || strings.Join(trace, " ") != tt.trace {
+			t.Errorf("GET %s: %q, trace %q, want %q %q", tt.path, body, strings.Join(trace, " "), tt.body, tt.trace)
+		}
+	}
+
+	for _, bad := range []func(){
+		func() { r.Group("api") },
+		func() { api.GET("x", func(*Ctx) {}) },
+		func() { api.GET("/nil", nil) },
+	} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Error("no panic")
+				}
+			}()
+			bad()
 		}()
 	}
 }

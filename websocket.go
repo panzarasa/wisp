@@ -1,14 +1,15 @@
 package wisp
 
-// WebSocket (RFC 6455) on the same gnet connection as HTTP: a handler calls
+// WebSocket (RFC 6455) on the same connection as HTTP: a handler calls
 // Ctx.Upgrade, the 101 response goes out, and from then on the connection's
 // events are frames instead of requests. Frames are parsed in place on the
-// event loop, like requests; no goroutine is started per connection.
+// connection's loop, like requests; no goroutine is started per connection.
 
 import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"io"
 	"log"
 	"runtime/debug"
 	"sync"
@@ -23,11 +24,6 @@ const (
 	DefaultWSMaxOutboundBytes = 4 << 20
 	DefaultWSIdleTimeout      = 60 * time.Second
 	DefaultWSCloseTimeout     = 5 * time.Second
-
-	// Timeouts are checked every quarter of the shortest one, within these
-	// bounds.
-	maxWSTick = time.Second
-	minWSTick = 10 * time.Millisecond
 )
 
 // WSMessageType is the type of a data message.
@@ -57,6 +53,8 @@ var (
 	// ErrWSInvalidClose is returned by Close for a code that cannot be sent
 	// or a reason longer than 123 bytes or not valid UTF-8.
 	ErrWSInvalidClose = errors.New("wisp: invalid WebSocket close code or reason")
+	// ErrWSBusy is returned by NextWriter while another writer is open.
+	ErrWSBusy = errors.New("wisp: a WebSocket message writer is already open")
 )
 
 // WSHandler is what a WebSocket endpoint does; one value usually serves
@@ -69,6 +67,13 @@ type WSHandler struct {
 	// data aliases the connection's buffers: it is valid only until
 	// OnMessage returns. Send copies it, so echoing it back is fine.
 	OnMessage func(ws *WSConn, typ WSMessageType, data []byte)
+	// OnFrame, if set, replaces OnMessage: it is called with every data
+	// frame as it arrives, so that a large message is handled piece by
+	// piece instead of being buffered whole. typ is the type of the message
+	// the frame belongs to and fin is true for its last frame; text is
+	// validated as UTF-8 across frames. MaxMessageBytes then limits a
+	// frame, and compression is not negotiated.
+	OnFrame func(ws *WSConn, typ WSMessageType, data []byte, fin bool)
 	// OnClose is called once when the connection is gone, with the code and
 	// reason of the peer's close frame: CloseNoStatus if it had no code,
 	// CloseAbnormal if the peer sent none (dropped, timed out or failed).
@@ -82,6 +87,9 @@ type WSHandler struct {
 	// Subprotocols the server speaks, in order of preference; the first one
 	// the client also offers is selected (WSConn.Subprotocol).
 	Subprotocols []string
+	// Compression enables permessage-deflate (RFC 7692) with the clients
+	// that offer it; nil disables it.
+	Compression *WSCompression
 
 	// MaxMessageBytes limits a received message, all of its fragments
 	// together (DefaultWSMaxMessageBytes if zero); larger ones close the
@@ -105,8 +113,8 @@ type WSHandler struct {
 type WSConn struct {
 	h           *WSHandler
 	srv         *Server
-	conn        gnet.Conn
-	loop        *wsLoop
+	conn        transport
+	loop        *loop
 	subprotocol string
 	remoteAddr  string
 
@@ -115,11 +123,14 @@ type WSConn struct {
 	idleTimeout  int64 // nanoseconds
 	closeTimeout int64
 
+	pmd *wsDeflate // permessage-deflate, if negotiated
+
 	// Owned by the event loop.
-	need     int // bytes the frame being received needs in total
-	fragOp   byte
-	frag     []byte
-	fragUTF8 utf8State
+	need           int // bytes the frame being received needs in total
+	fragOp         byte
+	frag           []byte
+	fragUTF8       utf8State
+	fragCompressed bool
 	// For a text frame still arriving: how much of its payload is validated
 	// already, and the validator's state there.
 	partialN     int
@@ -141,20 +152,9 @@ type WSConn struct {
 	overflow  bool // MaxOutboundBytes exceeded: drop the connection
 	closed    bool // the connection is gone
 	value     any
-}
-
-// wsLoop holds the WebSocket connections of one event loop; conns is only
-// touched on that loop.
-type wsLoop struct {
-	el    gnet.EventLoop
-	conns map[*WSConn]struct{}
-}
-
-var wsEpoch = time.Now()
-
-// monotime is a monotonic clock in nanoseconds.
-func monotime() int64 {
-	return int64(time.Since(wsEpoch))
+	// A NextWriter is open: the messages sent meanwhile wait in held.
+	streaming bool
+	held      []byte
 }
 
 // Upgrade switches the connection to WebSocket (RFC 6455, section 4.2):
@@ -166,10 +166,11 @@ func monotime() int64 {
 // 426 for a request without Upgrade or with another protocol version; 403
 // for an origin not allowed; 503 during Shutdown) and returns the error.
 func (c *Ctx) Upgrade(h *WSHandler) (*WSConn, error) {
-	if c.ws != nil {
+	if c.ws != nil || c.detached {
+		c.Text(500, statusText(500))
 		return nil, ErrWSHandshake
 	}
-	if c.srv != nil && c.srv.wsShutdown.Load() {
+	if c.srv != nil && c.srv.shutdown.Load() {
 		c.Text(503, statusText(503))
 		return nil, ErrWSUnavailable
 	}
@@ -205,6 +206,11 @@ func (c *Ctx) Upgrade(h *WSHandler) (*WSConn, error) {
 		c.Text(403, statusText(403))
 		return nil, ErrWSOrigin
 	}
+	var pmd *wsDeflate
+	var extensions string
+	if h.Compression != nil && h.OnFrame == nil {
+		pmd, extensions = negotiateDeflate(c, h.Compression)
+	}
 
 	ws := &WSConn{
 		h:            h,
@@ -215,6 +221,7 @@ func (c *Ctx) Upgrade(h *WSHandler) (*WSConn, error) {
 		maxOutbound:  orDefault(h.MaxOutboundBytes, DefaultWSMaxOutboundBytes),
 		idleTimeout:  int64(orDefault(h.IdleTimeout, DefaultWSIdleTimeout)),
 		closeTimeout: int64(orDefault(h.CloseTimeout, DefaultWSCloseTimeout)),
+		pmd:          pmd,
 		lastRead:     monotime(),
 		// Until the event loop takes the connection over, what the handler
 		// sends waits in out, behind the 101 response.
@@ -234,6 +241,11 @@ func (c *Ctx) Upgrade(h *WSHandler) (*WSConn, error) {
 	if ws.subprotocol != "" {
 		b = append(b, "Sec-WebSocket-Protocol: "...)
 		b = append(b, ws.subprotocol...)
+		b = append(b, "\r\n"...)
+	}
+	if extensions != "" {
+		b = append(b, "Sec-WebSocket-Extensions: "...)
+		b = append(b, extensions...)
 		b = append(b, "\r\n"...)
 	}
 	b = append(b, c.extra...)
@@ -358,12 +370,16 @@ func (ws *WSConn) SetContext(v any) {
 }
 
 // Send queues a message; data is copied, so the caller may reuse it. A nil
-// error means the message is queued, not that the peer received it.
+// error means the message is queued, not that the peer received it. With
+// compression negotiated, data is compressed by the caller's goroutine.
 func (ws *WSConn) Send(typ WSMessageType, data []byte) error {
 	if typ != WSText && typ != WSBinary || typ == WSText && !utf8.Valid(data) {
 		return ErrWSInvalidMessage
 	}
-	return wsQueue(ws, byte(typ), data)
+	if done, err := ws.sendCompressed(byte(typ), data); done {
+		return err
+	}
+	return wsQueue(ws, 0x80|byte(typ), data)
 }
 
 // SendText queues a text message, like Send.
@@ -371,7 +387,83 @@ func (ws *WSConn) SendText(s string) error {
 	if !utf8.ValidString(s) {
 		return ErrWSInvalidMessage
 	}
-	return wsQueue(ws, opText, s)
+	if ws.pmd != nil && len(s) >= ws.pmd.minSize {
+		return ws.Send(WSText, []byte(s))
+	}
+	return wsQueue(ws, 0x80|opText, s)
+}
+
+// NextWriter returns a writer for a message too large to build in memory
+// first: every Write sends one frame of it, uncompressed, and Close sends the
+// last one. The messages sent with Send until then follow the writer's
+// message. For text, the bytes written must be UTF-8 as a whole; if they are
+// not, Write or Close fails and the connection is closed with 1011. Only one
+// writer may be open at a time.
+func (ws *WSConn) NextWriter(typ WSMessageType) (io.WriteCloser, error) {
+	if typ != WSText && typ != WSBinary {
+		return nil, ErrWSInvalidMessage
+	}
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	switch {
+	case ws.closing || ws.closed:
+		return nil, ErrWSClosed
+	case ws.streaming:
+		return nil, ErrWSBusy
+	}
+	ws.streaming = true
+	return &wsWriter{ws: ws, op: byte(typ), text: typ == WSText}, nil
+}
+
+type wsWriter struct {
+	ws    *WSConn
+	op    byte // of the next frame: the message type, then continuation
+	text  bool
+	state utf8State
+	done  bool
+}
+
+func (w *wsWriter) Write(p []byte) (int, error) {
+	if w.done {
+		return 0, ErrWSClosed
+	}
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if w.text {
+		if w.state = utf8Feed(w.state, p); w.state == utf8Reject {
+			return 0, w.invalid()
+		}
+	}
+	if err := wsQueueFrom(w.ws, w.op, p, true); err != nil {
+		w.done = true
+		return 0, err
+	}
+	w.op = opContinuation
+	return len(p), nil
+}
+
+func (w *wsWriter) Close() error {
+	if w.done {
+		return ErrWSClosed
+	}
+	if w.text && w.state != utf8Accept {
+		return w.invalid()
+	}
+	w.done = true
+	return wsQueueFrom(w.ws, 0x80|w.op, "", true)
+}
+
+// invalid ends a text message that is not UTF-8: it cannot be finished, so
+// the connection is closed.
+func (w *wsWriter) invalid() error {
+	w.done = true
+	ws := w.ws
+	ws.mu.Lock()
+	ws.streaming, ws.held = false, nil
+	ws.mu.Unlock()
+	_ = ws.Close(CloseInternalError, "")
+	return ErrWSInvalidMessage
 }
 
 // Close starts the closing handshake (section 7.1.2): the messages already
@@ -383,18 +475,25 @@ func (ws *WSConn) Close(code int, reason string) error {
 		return ErrWSInvalidClose
 	}
 	var buf [maxControlPayload]byte
-	return wsQueue(ws, opClose, appendClosePayload(buf[:0], code, reason))
+	return wsQueue(ws, 0x80|opClose, appendClosePayload(buf[:0], code, reason))
 }
 
 // wsQueue appends a frame to ws.out and makes sure the event loop will
-// write it.
-func wsQueue[P string | []byte](ws *WSConn, op byte, payload P) error {
+// write it. b0 is the first byte of the frame: FIN, RSV1 and the opcode.
+func wsQueue[P string | []byte](ws *WSConn, b0 byte, payload P) error {
+	return wsQueueFrom(ws, b0, payload, false)
+}
+
+// wsQueueFrom is wsQueue for the frames of a NextWriter too: while one is
+// open, the data frames of other messages are held back until its last
+// frame.
+func wsQueueFrom[P string | []byte](ws *WSConn, b0 byte, payload P, writer bool) error {
 	ws.mu.Lock()
 	if ws.closing || ws.closed {
 		ws.mu.Unlock()
 		return ErrWSClosed
 	}
-	if len(ws.out)+len(payload) > ws.maxOutbound {
+	if len(ws.out)+len(ws.held)+len(payload) > ws.maxOutbound {
 		ws.overflow, ws.closing = true, true
 		schedule := ws.claimFlushLocked()
 		ws.mu.Unlock()
@@ -403,10 +502,23 @@ func wsQueue[P string | []byte](ws *WSConn, op byte, payload P) error {
 		}
 		return ErrWSOutboundFull
 	}
-	ws.out = appendFrameHeader(ws.out, op, len(payload))
+	op := b0 & 0x0F
+	if ws.streaming && !writer && op < opClose {
+		ws.held = appendFrameHeader(ws.held, b0, len(payload))
+		ws.held = append(ws.held, payload...)
+		ws.mu.Unlock()
+		return nil
+	}
+	ws.out = appendFrameHeader(ws.out, b0, len(payload))
 	ws.out = append(ws.out, payload...)
-	if op == opClose {
+	switch {
+	case op == opClose:
 		ws.closing, ws.closeAt = true, monotime()
+		ws.held = nil // no data frame may follow a close frame
+	case writer && b0&0x80 != 0:
+		ws.streaming = false
+		ws.out = append(ws.out, ws.held...)
+		ws.held = ws.held[:0]
 	}
 	schedule := ws.claimFlushLocked()
 	ws.mu.Unlock()
@@ -427,7 +539,7 @@ func (ws *WSConn) claimFlushLocked() bool {
 }
 
 func (ws *WSConn) scheduleFlush() {
-	if err := ws.conn.EventLoop().Execute(context.Background(), (*wsFlushTask)(ws)); err != nil {
+	if err := ws.conn.execute((*wsFlushTask)(ws)); err != nil {
 		// The engine is shutting down and closes every connection anyway.
 		ws.mu.Lock()
 		ws.scheduled = false
@@ -442,7 +554,7 @@ type wsFlushTask WSConn
 func (t *wsFlushTask) Run(context.Context) error {
 	ws := (*WSConn)(t)
 	if !ws.flush() {
-		ws.conn.Close()
+		_ = ws.conn.Close()
 	}
 	return nil
 }
@@ -487,7 +599,7 @@ func (ws *WSConn) flush() bool {
 func (ws *WSConn) fail(code int, reason string) bool {
 	ws.mu.Lock()
 	if !ws.closing && !ws.closed {
-		ws.out = appendFrameHeader(ws.out, opClose, 2+len(reason))
+		ws.out = appendFrameHeader(ws.out, 0x80|opClose, 2+len(reason))
 		ws.out = appendClosePayload(ws.out, code, reason)
 		ws.closing, ws.closeAt = true, monotime()
 	}
@@ -516,8 +628,10 @@ func (ws *WSConn) process(buf []byte) (consumed int, closeConn bool) {
 			return consumed, false
 		}
 		fin, op := data[0]&0x80 != 0, data[0]&0x0F
-		if data[0]&0x70 != 0 {
-			// No extension is negotiated, so RSV1-3 must be zero.
+		// RSV1 marks a compressed message, on its first frame only; RSV2 and
+		// RSV3 belong to no extension.
+		compressed := data[0]&0x40 != 0
+		if data[0]&0x30 != 0 || compressed && (ws.pmd == nil || op != opText && op != opBinary) {
 			return consumed, ws.fail(CloseProtocolError, "reserved bits set")
 		}
 		if data[1]&0x80 == 0 {
@@ -566,9 +680,10 @@ func (ws *WSConn) process(buf []byte) (consumed int, closeConn bool) {
 
 		total := hdr + int(n)
 		if len(data) < total {
-			if op == opText || op == opContinuation && ws.fragOp == opText {
+			if !compressed && (op == opText || op == opContinuation && ws.fragOp == opText && !ws.fragCompressed) {
 				// Invalid UTF-8 fails the connection as soon as it arrives,
 				// not when the frame is complete: come back for every chunk.
+				// Compressed text can only be checked once decompressed.
 				if len(data) >= hdr && !ws.checkPartialText(op, data[hdr-4:hdr], data[hdr:]) {
 					return consumed, ws.fail(CloseInvalidPayload, "invalid UTF-8")
 				}
@@ -585,13 +700,28 @@ func (ws *WSConn) process(buf []byte) (consumed int, closeConn bool) {
 
 		switch op {
 		case opText, opBinary:
+			if ws.h.OnFrame != nil {
+				if !ws.frame(op, payload, fin, utf8Accept) {
+					return consumed, ws.fail(CloseInvalidPayload, "invalid UTF-8")
+				}
+				if !fin {
+					ws.fragOp = op
+				}
+				continue
+			}
 			if !fin {
-				ws.fragOp = op
+				ws.fragOp, ws.fragCompressed = op, compressed
 				ws.frag = append(ws.frag[:0], payload...)
-				if op == opText {
+				if op == opText && !compressed {
 					if ws.fragUTF8 = ws.textState(utf8Accept, payload); ws.fragUTF8 == utf8Reject {
 						return consumed, ws.fail(CloseInvalidPayload, "invalid UTF-8")
 					}
+				}
+				continue
+			}
+			if compressed {
+				if code := ws.deliverCompressed(op, payload); code != 0 {
+					return consumed, ws.fail(code, "")
 				}
 				continue
 			}
@@ -601,8 +731,18 @@ func (ws *WSConn) process(buf []byte) (consumed int, closeConn bool) {
 			ws.deliver(op, payload)
 
 		case opContinuation:
+			if ws.h.OnFrame != nil {
+				op := ws.fragOp
+				if fin {
+					ws.fragOp = 0
+				}
+				if !ws.frame(op, payload, fin, ws.fragUTF8) {
+					return consumed, ws.fail(CloseInvalidPayload, "invalid UTF-8")
+				}
+				continue
+			}
 			ws.frag = append(ws.frag, payload...)
-			if ws.fragOp == opText {
+			if ws.fragOp == opText && !ws.fragCompressed {
 				ws.fragUTF8 = ws.textState(ws.fragUTF8, payload)
 				if ws.fragUTF8 == utf8Reject || fin && ws.fragUTF8 != utf8Accept {
 					return consumed, ws.fail(CloseInvalidPayload, "invalid UTF-8")
@@ -611,7 +751,14 @@ func (ws *WSConn) process(buf []byte) (consumed int, closeConn bool) {
 			if fin {
 				op := ws.fragOp
 				ws.fragOp = 0
-				ws.deliver(op, ws.frag)
+				if ws.fragCompressed {
+					ws.fragCompressed = false
+					if code := ws.deliverCompressed(op, ws.frag); code != 0 {
+						return consumed, ws.fail(code, "")
+					}
+				} else {
+					ws.deliver(op, ws.frag)
+				}
 				if cap(ws.frag) > maxPooledBuffer {
 					ws.frag = nil
 				} else {
@@ -621,7 +768,7 @@ func (ws *WSConn) process(buf []byte) (consumed int, closeConn bool) {
 
 		case opPing:
 			// Refused only once closing, when no frame may follow the close.
-			_ = wsQueue(ws, opPong, payload)
+			_ = wsQueue(ws, 0x80|opPong, payload)
 
 		case opPong:
 			// Traffic is all a pong is for: wsTraffic noted it.
@@ -637,10 +784,10 @@ func (ws *WSConn) process(buf []byte) (consumed int, closeConn bool) {
 			// (section 7.1.1).
 			var echo [2]byte
 			if code == CloseNoStatus {
-				_ = wsQueue(ws, opClose, echo[:0])
+				_ = wsQueue(ws, 0x80|opClose, echo[:0])
 			} else {
 				binary.BigEndian.PutUint16(echo[:], uint16(code))
-				_ = wsQueue(ws, opClose, echo[:])
+				_ = wsQueue(ws, 0x80|opClose, echo[:])
 			}
 			return consumed, true
 		}
@@ -686,6 +833,38 @@ func (ws *WSConn) textState(s utf8State, payload []byte) utf8State {
 	return utf8Feed(s, payload)
 }
 
+// frame passes a data frame to OnFrame, after validating text from state s.
+// It returns false if the text is not valid UTF-8.
+func (ws *WSConn) frame(op byte, payload []byte, fin bool, s utf8State) bool {
+	if op == opText {
+		ws.fragUTF8 = ws.textState(s, payload)
+		if ws.fragUTF8 == utf8Reject || fin && ws.fragUTF8 != utf8Accept {
+			return false
+		}
+	}
+	ws.mu.Lock()
+	closing := ws.closing
+	ws.mu.Unlock()
+	if !closing {
+		ws.h.OnFrame(ws, WSMessageType(op), payload, fin)
+	}
+	return true
+}
+
+// deliverCompressed decompresses a message and delivers it. It returns the
+// close code to fail the connection with, if any.
+func (ws *WSConn) deliverCompressed(op byte, payload []byte) int {
+	data, code := ws.pmd.inflate(payload, ws.maxMessage)
+	if code != 0 {
+		return code
+	}
+	if op == opText && !utf8.Valid(data) {
+		return CloseInvalidPayload
+	}
+	ws.deliver(op, data)
+	return 0
+}
+
 func (ws *WSConn) deliver(op byte, data []byte) {
 	if ws.h.OnMessage == nil {
 		return
@@ -705,35 +884,26 @@ func (ws *WSConn) discard() {
 	ws.mu.Unlock()
 }
 
-// wsAttach hands the upgraded connection over to the event loop.
-func (s *Server) wsAttach(c gnet.Conn, ws *WSConn) {
-	el := c.EventLoop()
-	s.wsMu.Lock()
-	l := s.wsLoops[el]
-	if l == nil {
-		l = &wsLoop{el: el, conns: make(map[*WSConn]struct{})}
-		if s.wsLoops == nil {
-			s.wsLoops = make(map[gnet.EventLoop]*wsLoop)
-		}
-		s.wsLoops[el] = l
-	}
-	s.wsMu.Unlock()
-
-	ws.conn, ws.loop = c, l
-	l.conns[ws] = struct{}{}
+// wsAttach hands the upgraded connection over to its loop.
+func (s *Server) wsAttach(ws *WSConn, t transport, l *loop) {
+	ws.conn, ws.loop = t, l
+	l.ws[ws] = struct{}{}
 	s.wsActive.Add(1)
-	s.lowerWSTick(min(ws.idleTimeout, ws.closeTimeout) / 4)
+	s.lowerTick(min(ws.idleTimeout, ws.closeTimeout) / 4)
 
 	// Shutdown may have looked at the loops before this one was added.
-	if s.wsShutdown.Load() {
+	if s.shutdown.Load() {
 		_ = ws.Close(CloseGoingAway, "server shutting down")
 	}
 }
 
-// wsDetach runs on the event loop when a WebSocket connection is gone.
+// wsDetach runs on the loop when a WebSocket connection is gone.
 func (s *Server) wsDetach(ws *WSConn) {
 	ws.discard()
-	delete(ws.loop.conns, ws)
+	if ws.pmd != nil {
+		ws.pmd.release()
+	}
+	delete(ws.loop.ws, ws)
 	s.wsActive.Add(-1)
 
 	if ws.h.OnClose == nil {
@@ -751,12 +921,13 @@ func (s *Server) wsDetach(ws *WSConn) {
 	ws.h.OnClose(ws, code, reason)
 }
 
-// wsTraffic is OnTraffic for an upgraded connection.
-func (s *Server) wsTraffic(c gnet.Conn, ws *WSConn) gnet.Action {
+// wsTraffic handles what arrived on a WebSocket connection.
+func (s *Server) wsTraffic(ws *WSConn) bool {
 	ws.mu.Lock()
 	ws.flushing = true
 	ws.mu.Unlock()
 
+	c := ws.conn
 	closeConn := false
 	if n := c.InboundBuffered(); n > 0 {
 		ws.lastRead, ws.pingSent = monotime(), false
@@ -769,85 +940,36 @@ func (s *Server) wsTraffic(c gnet.Conn, ws *WSConn) gnet.Action {
 			closeConn = cc
 		}
 	}
-	if !ws.flush() || closeConn {
-		return gnet.Close
-	}
-	return gnet.None
+	return !ws.flush() || closeConn
 }
 
-func (s *Server) lowerWSTick(d int64) {
-	d = max(d, int64(minWSTick))
-	for {
-		cur := s.wsTick.Load()
-		if cur != 0 && cur <= d || s.wsTick.CompareAndSwap(cur, d) {
-			return
-		}
-	}
-}
+// checkTimeouts runs on the loop, at every timeout check.
+func (ws *WSConn) checkTimeouts(now int64) {
+	ws.mu.Lock()
+	closing, closeAt := ws.closing, ws.closeAt
+	ws.mu.Unlock()
 
-func (s *Server) wsTickInterval() time.Duration {
-	if d := time.Duration(s.wsTick.Load()); d > 0 && d < maxWSTick {
-		return d
-	}
-	return maxWSTick
-}
-
-// wsSweep queues the timeout checks on every event loop that has
-// WebSocket connections; it runs on gnet's ticker goroutine.
-func (s *Server) wsSweep() {
-	s.wsMu.Lock()
-	defer s.wsMu.Unlock()
-	for el, l := range s.wsLoops {
-		_ = el.Execute(context.Background(), l)
+	// A peer is dropped only if a ping went unanswered, however late the
+	// first check comes.
+	switch {
+	case closing && now-closeAt > ws.closeTimeout:
+		_ = ws.conn.Close()
+	case ws.pingSent && now-ws.pingAt > ws.idleTimeout/2:
+		_ = ws.conn.Close()
+	case !closing && !ws.pingSent && now-ws.lastRead > ws.idleTimeout/2:
+		ws.pingSent, ws.pingAt = true, now
+		_ = wsQueue(ws, 0x80|opPing, "")
 	}
 }
 
-// Run checks the timeouts of the loop's connections, on the loop.
-func (l *wsLoop) Run(context.Context) error {
-	now := monotime()
-	for ws := range l.conns {
-		ws.mu.Lock()
-		closing, closeAt := ws.closing, ws.closeAt
-		ws.mu.Unlock()
-
-		// A peer is dropped only if a ping went unanswered, however late
-		// the first check comes.
-		switch {
-		case closing && now-closeAt > ws.closeTimeout:
-			ws.conn.Close()
-		case ws.pingSent && now-ws.pingAt > ws.idleTimeout/2:
-			ws.conn.Close()
-		case !closing && !ws.pingSent && now-ws.lastRead > ws.idleTimeout/2:
-			ws.pingSent, ws.pingAt = true, now
-			_ = wsQueue(ws, opPing, "")
-		}
-	}
-	return nil
-}
-
-// wsShutdownAll starts the closing handshake on every WebSocket connection
-// and waits for them to be gone, or for ctx to expire.
-func (s *Server) wsShutdownAll(ctx context.Context) {
-	s.wsShutdown.Store(true)
-
-	s.wsMu.Lock()
-	for el, l := range s.wsLoops {
-		_ = el.Execute(ctx, gnet.RunnableFunc(func(context.Context) error {
-			for ws := range l.conns {
+// wsCloseAll starts the closing handshake on every WebSocket connection.
+func (s *Server) wsCloseAll() {
+	s.eachLoop(func(l *loop) gnet.Runnable {
+		return gnet.RunnableFunc(func(context.Context) error {
+			for ws := range l.ws {
 				_ = ws.Close(CloseGoingAway, "server shutting down")
 			}
 			return nil
-		}))
-	}
-	s.wsMu.Unlock()
-
-	tick := time.NewTicker(10 * time.Millisecond)
-	defer tick.Stop()
-	for s.wsActive.Load() > 0 {
-		select {
-		case <-ctx.Done():
-			return
-		case <-tick.C:
-		}
-	}
+		})
+	})
 }

@@ -3,8 +3,6 @@ package wisp
 import (
 	"strconv"
 
-	"github.com/panjf2000/gnet/v2"
-
 	"github.com/panzarasa/wisp/wildcat"
 )
 
@@ -22,33 +20,50 @@ type param struct {
 // Ctx is the request being handled and the writer for its response.
 //
 // A Ctx and every []byte obtained from it (Method, Path, Query, Body, Param,
-// Header) alias the connection's read buffer: they are only valid until the
-// handler returns. Copy what must outlive the handler.
+// Header, QueryParam...) alias the connection's buffers: they are only valid
+// until the handler returns. Copy what must outlive the handler.
 type Ctx struct {
 	Method []byte
-	Path   []byte // without the query string
-	Query  []byte // raw query string, without the '?'
-	Body   []byte
+	// Path is the request path, percent-decoded except for "%2F", without
+	// the query string. For an absolute-form target ("GET http://host/x")
+	// it is the path part ("/x"); for "OPTIONS *" it is "*".
+	Path []byte
+	// RawPath is Path as it was sent, not decoded.
+	RawPath []byte
+	Query   []byte // raw query string, without the '?'
+	Body    []byte
 
 	req     *wildcat.HTTPParser
 	srv     *Server
-	conn    gnet.Conn // nil when process runs without gnet, in tests
-	ws      *WSConn   // set by Upgrade
+	st      *connState // nil for a detached Ctx (Async) and in tests
+	conn    transport  // nil outside a connection, in tests
+	ws      *WSConn    // set by Upgrade
 	params  [MaxParams]param
 	nparams int
 
-	out       []byte // responses of this connection waiting to be written
-	respStart int    // offset in out of the response to the current request
-	extra     []byte // extra response headers set by SetHeader
-	responded bool
-	close     bool // the connection is closed after this response
-	head      bool // HEAD request: the response body is not sent
+	host    []byte // authority of an absolute-form target
+	pathBuf []byte // Path, when it had to be decoded
+	query   args
+	form    args
+
+	out        []byte // responses of this connection waiting to be written
+	respStart  int    // offset in out of the response to the current request
+	extra      []byte // extra response headers set by SetHeader
+	bodyStream *BodyStream
+	responded  bool
+	close      bool // the connection is closed after this response
+	head       bool // HEAD request: the response body is not sent
+	detached   bool // a copy handed to an Async handler
 }
 
 func (c *Ctx) reset() {
 	c.respStart = len(c.out)
 	c.extra = c.extra[:0]
 	c.nparams = 0
+	c.host = nil
+	c.query.reset()
+	c.form.reset()
+	c.bodyStream = nil
 	c.responded = false
 	c.close = false
 	c.head = false
@@ -142,6 +157,10 @@ func (c *Ctx) writeHead(status int, contentType string, bodyLen int) bool {
 		b = append(b, "Content-Length: "...)
 		b = strconv.AppendInt(b, int64(bodyLen), 10)
 		b = append(b, "\r\n"...)
+	}
+	if c.detached && !c.close && c.srv != nil && c.srv.shutdown.Load() {
+		// An Async response finishing during Shutdown is the last one.
+		c.close = true
 	}
 	if c.close {
 		b = append(b, "Connection: close\r\n"...)

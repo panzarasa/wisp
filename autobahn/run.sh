@@ -2,11 +2,11 @@
 # Runs the Autobahn TestSuite (fuzzingclient mode), the reference conformance
 # test for RFC 6455, against the /ws/echo endpoint of cmd/server.
 #
-#   autobahn/run.sh        about 2 minutes; needs Docker ("colima start")
+#   autobahn/run.sh        a few minutes; needs Docker ("colima start")
 #
-# The server runs inside the Autobahn container, next to the test client.
-# Cases 12.* and 13.* test permessage-deflate, which is not implemented, and
-# are excluded. The HTML report ends up in autobahn/reports/index.html.
+# The server runs inside the Autobahn container, next to the test client,
+# with permessage-deflate enabled, which cases 12.* and 13.* test. The HTML
+# report ends up in autobahn/reports/index.html.
 set -eu
 
 cd "$(dirname "$0")/.."
