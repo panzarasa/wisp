@@ -21,11 +21,12 @@ goroutine per connection.
 - HTTPS with `crypto/tls`, served by the same HTTP and WebSocket code.
 - `Ctx.Upgrade` turns the connection into a WebSocket. The frames travel on
   the same gnet connection, so an open WebSocket costs about 1 KB of memory.
-  permessage-deflate (RFC 7692), streaming of large messages in both
-  directions.
+  It supports permessage-deflate (RFC 7692) and streams large messages in
+  both directions.
 - The [Autobahn TestSuite](https://github.com/crossbario/autobahn-testsuite)
-  passes with no failures (`autobahn/run.sh`); the compression cases (12.*,
-  13.*) are now enabled too.
+  (`autobahn/run.sh`) last passed with no failures before compression was
+  added: 298 cases OK, 3 informational, compression cases (12.*, 13.*)
+  excluded. The run now includes them; it has not completed yet.
 
 ## Example
 
@@ -164,6 +165,7 @@ loads a certificate pair; `ServeTLS(ln, config)` takes any `tls.Config`.
 - HTTP/2
 - transfer codings other than `chunked`; chunked bodies larger than
   `MaxBodyBytes` (only `Content-Length` bodies can be streamed)
+- streaming responses: a response is built whole in memory before it is sent
 
 ## Benchmarks
 
